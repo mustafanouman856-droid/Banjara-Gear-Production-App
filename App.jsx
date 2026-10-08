@@ -9,6 +9,69 @@ import {
 /* ----------------------------- Supabase connection ----------------------------- */
 const SUPABASE_URL = "https://ywuldhssdqhaeqlbmpnt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_qRjtWKM6isqxwe5hECExpQ_PjSF4OrO";
+const REFRESH_KEY = "banjara_refresh_token";
+const PHOTO_BUCKET = "product-photos";
+
+// Current login session, held in memory. The refresh token is also kept in the
+// browser so staff stay signed in after closing the tab.
+let session = null; // { accessToken, refreshToken }
+
+function saveRefreshToken(token) {
+  try { localStorage.setItem(REFRESH_KEY, token); } catch (e) { /* ignore */ }
+}
+function clearRefreshToken() {
+  try { localStorage.removeItem(REFRESH_KEY); } catch (e) { /* ignore */ }
+}
+
+function setSessionFromAuth(data) {
+  session = { accessToken: data.access_token, refreshToken: data.refresh_token };
+  saveRefreshToken(data.refresh_token);
+}
+
+async function refreshSession() {
+  if (!session?.refreshToken) throw new Error("Not signed in.");
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
+    body: JSON.stringify({ refresh_token: session.refreshToken }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    session = null;
+    clearRefreshToken();
+    throw new Error("Your session expired. Please sign in again.");
+  }
+  setSessionFromAuth(data);
+  return data;
+}
+
+// Every request after login goes through here. If the login has expired it
+// renews it once and retries.
+async function authedFetch(url, options = {}, retry = true) {
+  const headers = {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${session?.accessToken}`,
+    ...(options.headers || {}),
+  };
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401 && retry) {
+    await refreshSession();
+    return authedFetch(url, options, false);
+  }
+  return res;
+}
+
+async function loadUserWithProfile(authUser) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${authUser.id}&select=name,role`);
+  const profiles = await res.json();
+  const profile = Array.isArray(profiles) ? profiles[0] : null;
+  return {
+    id: authUser.id,
+    email: authUser.email,
+    name: profile?.name || authUser.email,
+    role: profile?.role || "production",
+  };
+}
 
 async function supabaseSignIn(email, password) {
   const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
@@ -20,35 +83,163 @@ async function supabaseSignIn(email, password) {
   if (!res.ok) {
     throw new Error(data.error_description || data.msg || "Incorrect email or password.");
   }
-  const profRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${data.user.id}&select=name,role`, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${data.access_token}` },
-  });
-  const profiles = await profRes.json();
-  const profile = Array.isArray(profiles) ? profiles[0] : null;
-  return {
-    id: data.user.id,
-    email: data.user.email,
-    name: profile?.name || data.user.email,
-    role: profile?.role || "production",
-    accessToken: data.access_token,
-  };
+  setSessionFromAuth(data);
+  return loadUserWithProfile(data.user);
 }
 
-async function supabaseSignOut(accessToken) {
+// Called when the app opens: if this browser was signed in before, resume.
+async function restoreSession() {
+  let token = null;
+  try { token = localStorage.getItem(REFRESH_KEY); } catch (e) { /* ignore */ }
+  if (!token) return null;
+  session = { accessToken: null, refreshToken: token };
+  try {
+    const data = await refreshSession();
+    return await loadUserWithProfile(data.user);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function supabaseSignOut() {
+  const token = session?.accessToken;
+  session = null;
+  clearRefreshToken();
   try {
     await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
       method: "POST",
-      headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}` },
+      headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
     });
   } catch (e) { /* non-blocking */ }
 }
 
-async function fetchProfiles(accessToken) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/profiles?select=id,name,role&order=name`, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}` },
-  });
+async function fetchProfiles() {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/profiles?select=id,name,role&order=name`);
   if (!res.ok) return [];
   return res.json();
+}
+
+/* ----------------------------- Product data ----------------------------- */
+function mapProduct(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    leatherType: row.leather_type || "",
+    colors: row.colors || [],
+    engravingAvailable: row.engraving_available !== false,
+    instructions: row.instructions || "",
+    archived: !!row.archived,
+    photos: (row.product_photos || [])
+      .slice()
+      .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+      .map((p) => ({ id: p.id, url: p.url, label: p.label || "" })),
+  };
+}
+
+async function readError(res, fallback) {
+  try {
+    const body = await res.json();
+    return body.message || body.error || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+async function loadProducts() {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/products?select=*,product_photos(*)&order=name`);
+  if (!res.ok) throw new Error(await readError(res, "Couldn't load products."));
+  const rows = await res.json();
+  return rows.map(mapProduct);
+}
+
+// Shrinks a photo to at most 1200px on its longest side before uploading, so
+// pages stay fast on phones.
+async function compressImage(file, maxSize = 1200, quality = 0.8) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Couldn't process that photo."))), "image/jpeg", quality)
+  );
+}
+
+async function uploadProductPhoto(productId, file) {
+  const blob = await compressImage(file);
+  const path = `${productId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  const res = await authedFetch(`${SUPABASE_URL}/storage/v1/object/${PHOTO_BUCKET}/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "image/jpeg" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(await readError(res, "Photo upload failed."));
+  return `${SUPABASE_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${path}`;
+}
+
+async function deletePhotoFile(url) {
+  const marker = `/${PHOTO_BUCKET}/`;
+  const idx = url.indexOf(marker);
+  if (idx === -1) return;
+  const path = url.slice(idx + marker.length);
+  try {
+    await authedFetch(`${SUPABASE_URL}/storage/v1/object/${PHOTO_BUCKET}/${path}`, { method: "DELETE" });
+  } catch (e) { /* best effort */ }
+}
+
+async function saveProduct({ id, fields, removedPhotos, newPhotos, existingCount }) {
+  const body = {
+    name: fields.name,
+    leather_type: fields.leatherType,
+    colors: fields.colors,
+    engraving_available: fields.engravingAvailable,
+    instructions: fields.instructions,
+  };
+  let productId = id;
+  if (id) {
+    const res = await authedFetch(`${SUPABASE_URL}/rest/v1/products?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await readError(res, "Couldn't save the product."));
+  } else {
+    const res = await authedFetch(`${SUPABASE_URL}/rest/v1/products`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Prefer: "return=representation" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await readError(res, "Couldn't create the product."));
+    const rows = await res.json();
+    productId = rows[0].id;
+  }
+
+  for (const photo of removedPhotos) {
+    const res = await authedFetch(`${SUPABASE_URL}/rest/v1/product_photos?id=eq.${photo.id}`, { method: "DELETE" });
+    if (res.ok) deletePhotoFile(photo.url);
+  }
+
+  let order = existingCount;
+  for (const np of newPhotos) {
+    const url = await uploadProductPhoto(productId, np.file);
+    const res = await authedFetch(`${SUPABASE_URL}/rest/v1/product_photos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product_id: productId, url, label: np.label, sort_order: order++ }),
+    });
+    if (!res.ok) throw new Error(await readError(res, "Couldn't attach a photo."));
+  }
+  return productId;
+}
+
+async function setProductArchived(id, archived) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/products?id=eq.${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived }),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't update the product."));
 }
 
 /* ----------------------------- Design tokens ----------------------------- */
@@ -73,7 +264,7 @@ const TOKENS = {
 /* USERS is no longer used for login — real accounts live in Supabase. Kept here only as a fallback label list. */
 
 
-const PRODUCTS = [
+const SAMPLE_PRODUCTS = [
   {
     id: "p1", name: "Aviator Bag", leatherType: "Oily Pull-Up",
     colors: ["Tan", "Brown", "Black"], engravingAvailable: true,
@@ -798,13 +989,28 @@ function Row({ label, value, highlight }) {
 }
 
 /* ----------------------------- Products ----------------------------- */
+const PHOTO_LABELS = ["Main", "Back", "Inside", "Hardware / details", "Other"];
+
+function PhotoPlaceholder({ className = "h-32" }) {
+  return (
+    <div className={`${className} w-full flex items-center justify-center`} style={{ backgroundColor: TOKENS.hide }}>
+      <ImageIcon size={22} style={{ color: "#C9BCA8" }} />
+    </div>
+  );
+}
+
 function ProductCard({ product, onOpen }) {
   return (
-    <button onClick={() => onOpen(product)} className="text-left rounded-2xl border overflow-hidden transition hover:shadow-sm" style={{ borderColor: TOKENS.line, backgroundColor: "white" }}>
-      <img src={product.photos[0]?.url} loading="lazy" className="h-32 w-full object-cover" alt={product.name} />
+    <button onClick={() => onOpen(product)} className="text-left rounded-2xl border overflow-hidden transition hover:shadow-sm" style={{ borderColor: TOKENS.line, backgroundColor: "white", opacity: product.archived ? 0.6 : 1 }}>
+      {product.photos[0]
+        ? <img src={product.photos[0].url} loading="lazy" decoding="async" className="h-32 w-full object-cover" alt={product.name} />
+        : <PhotoPlaceholder />}
       <div className="p-3">
-        <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>{product.name}</p>
-        <p className="text-xs mt-0.5" style={{ color: "#8A7B65" }}>{product.leatherType}</p>
+        <div className="flex items-center gap-1.5">
+          <p className="text-sm font-bold truncate" style={{ color: TOKENS.ink }}>{product.name}</p>
+          {product.archived && <span className="text-[10px] font-bold rounded px-1.5 py-0.5" style={{ backgroundColor: TOKENS.hide, color: "#8A7B65" }}>ARCHIVED</span>}
+        </div>
+        <p className="text-xs mt-0.5" style={{ color: "#8A7B65" }}>{product.leatherType || "No leather type set"}</p>
         <div className="flex items-center gap-1 mt-2 flex-wrap">
           {product.colors.map((c) => <span key={c} className="text-[10px] rounded px-1.5 py-0.5" style={{ backgroundColor: TOKENS.hide, color: "#5A4E3F" }}>{c}</span>)}
         </div>
@@ -813,23 +1019,50 @@ function ProductCard({ product, onOpen }) {
   );
 }
 
-function ProductsPage({ products, user, onOpenProduct }) {
+function ProductsPage({ products, loading, error, user, onOpenProduct, onAdd, onRetry }) {
   const [q, setQ] = useState("");
-  const list = products.filter((p) => !p.archived && p.name.toLowerCase().includes(q.toLowerCase()));
+  const [showArchived, setShowArchived] = useState(false);
+  const isOwner = user.role === "owner";
+  const list = products.filter((p) => (showArchived ? true : !p.archived) && p.name.toLowerCase().includes(q.toLowerCase()));
+  const archivedCount = products.filter((p) => p.archived).length;
+
   return (
     <div className="p-4 md:p-8 max-w-4xl">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold" style={{ color: TOKENS.ink }}>Product Library</h1>
-        {user.role === "owner" && (
-          <button className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold text-white" style={{ backgroundColor: TOKENS.saddle }}>
+        {isOwner && (
+          <button onClick={onAdd} className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold text-white" style={{ backgroundColor: TOKENS.saddle }}>
             <Plus size={14} /> Add product
           </button>
         )}
       </div>
-      <div className="mt-4 relative max-w-sm">
-        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#A8977F" }} />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search products" className="w-full rounded-xl border pl-9 pr-3 py-2.5 text-sm outline-none" style={{ borderColor: TOKENS.line }} />
+      <div className="mt-4 flex items-center gap-3 flex-wrap">
+        <div className="relative w-full max-w-sm">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#A8977F" }} />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search products" className="w-full rounded-xl border pl-9 pr-3 py-2.5 text-sm outline-none" style={{ borderColor: TOKENS.line }} />
+        </div>
+        {isOwner && archivedCount > 0 && (
+          <button onClick={() => setShowArchived((s) => !s)} className="text-xs font-semibold" style={{ color: TOKENS.saddle }}>
+            {showArchived ? "Hide archived" : `Show archived (${archivedCount})`}
+          </button>
+        )}
       </div>
+
+      {loading && <p className="mt-8 text-sm text-center" style={{ color: "#A8977F" }}>Loading products…</p>}
+      {error && (
+        <div className="mt-6 rounded-xl p-4 text-sm" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>
+          {error} <button onClick={onRetry} className="font-bold underline ml-1">Try again</button>
+        </div>
+      )}
+      {!loading && !error && products.filter((p) => !p.archived).length === 0 && (
+        <div className="mt-10 text-center">
+          <Boxes size={28} className="mx-auto mb-3" style={{ color: "#C9BCA8" }} />
+          <p className="text-sm font-semibold" style={{ color: TOKENS.ink }}>No products yet</p>
+          <p className="text-xs mt-1" style={{ color: "#A8977F" }}>
+            {isOwner ? "Add your first product to start building the library." : "The owner hasn't added any products yet."}
+          </p>
+        </div>
+      )}
       <div className="mt-4 grid grid-cols-2 md:grid-cols-3 gap-3">
         {list.map((p) => <ProductCard key={p.id} product={p} onOpen={onOpenProduct} />)}
       </div>
@@ -837,7 +1070,25 @@ function ProductsPage({ products, user, onOpenProduct }) {
   );
 }
 
-function ProductDetail({ product, user, onClose }) {
+function ProductDetail({ product, user, onClose, onEdit, onToggleArchive }) {
+  const [zoom, setZoom] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggle = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await onToggleArchive(product);
+      setConfirming(false);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end" style={{ backgroundColor: "rgba(0,0,0,0.45)" }}>
       <div className="h-full w-full md:w-[480px] overflow-y-auto" style={{ backgroundColor: TOKENS.paper }}>
@@ -849,28 +1100,183 @@ function ProductDetail({ product, user, onClose }) {
           <button onClick={onClose} className="hidden md:block"><X size={19} style={{ color: TOKENS.ink }} /></button>
         </div>
         <div className="p-4 space-y-5 pb-10">
-          <div className="grid grid-cols-3 gap-1">
-            {product.photos.map((ph, i) => (
-              <div key={i}>
-                <img src={ph.url} loading="lazy" className="h-24 w-full object-cover rounded-lg" alt={ph.label} />
-                <p className="text-[10px] mt-1 text-center" style={{ color: "#8A7B65" }}>{ph.label}</p>
-              </div>
-            ))}
-          </div>
+          {product.archived && (
+            <div className="rounded-lg px-3 py-2 text-xs font-medium" style={{ backgroundColor: TOKENS.hide, color: "#8A7B65" }}>
+              This product is archived. It's hidden from the library but past orders still show it.
+            </div>
+          )}
+          {product.photos.length === 0 ? (
+            <div className="rounded-xl overflow-hidden"><PhotoPlaceholder className="h-32" /></div>
+          ) : (
+            <div className="grid grid-cols-3 gap-1.5">
+              {product.photos.map((ph) => (
+                <button key={ph.id} onClick={() => setZoom(ph)} className="text-left">
+                  <img src={ph.url} loading="lazy" decoding="async" className="h-24 w-full object-cover rounded-lg" alt={ph.label} />
+                  <p className="text-[10px] mt-1 text-center truncate" style={{ color: "#8A7B65" }}>{ph.label}</p>
+                </button>
+              ))}
+            </div>
+          )}
           <Section title="Leather">
-            <Row label="Type" value={product.leatherType} />
-            <Row label="Colors" value={product.colors.join(", ")} />
+            <Row label="Type" value={product.leatherType || "—"} />
+            <Row label="Colors" value={product.colors.length ? product.colors.join(", ") : "—"} />
             <Row label="Engraving" value={product.engravingAvailable ? "Available" : "Not offered"} />
           </Section>
           <Section title="Production instructions">
-            <p className="text-sm" style={{ color: "#5A4E3F" }}>{product.instructions}</p>
+            <p className="text-sm whitespace-pre-wrap" style={{ color: "#5A4E3F" }}>{product.instructions || "No instructions added."}</p>
           </Section>
-          {user.role === "owner" && (
+
+          {user.role === "owner" && !confirming && (
             <div className="flex gap-2">
-              <button className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}><Edit2 size={14} /> Edit</button>
-              <button className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: "#C24A2E" }}><Archive size={14} /> Archive</button>
+              <button onClick={() => onEdit(product)} className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}><Edit2 size={14} /> Edit</button>
+              {product.archived ? (
+                <button onClick={toggle} disabled={busy} className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.saddle }}>
+                  {busy ? "Restoring…" : "Restore"}
+                </button>
+              ) : (
+                <button onClick={() => setConfirming(true)} className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: "#C24A2E" }}><Archive size={14} /> Archive</button>
+              )}
             </div>
           )}
+          {confirming && (
+            <ConfirmBar label={`Archive ${product.name}?`} question="It will be hidden from the library. Past orders keep working, and you can restore it later." onCancel={() => setConfirming(false)} onConfirm={toggle} tone="#C24A2E" />
+          )}
+          {error && <p className="text-xs" style={{ color: "#B23A22" }}>{error}</p>}
+        </div>
+      </div>
+
+      {zoom && (
+        <div className="fixed inset-0 z-[60] flex flex-col items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.9)" }} onClick={() => setZoom(null)}>
+          <button className="absolute top-4 right-4"><X size={24} color="white" /></button>
+          <img src={zoom.url} alt={zoom.label} className="max-h-[80vh] max-w-full object-contain rounded-lg" />
+          <p className="mt-3 text-sm text-white">{zoom.label}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProductForm({ product, onClose, onSaved }) {
+  const editing = !!product;
+  const [name, setName] = useState(product?.name || "");
+  const [leatherType, setLeatherType] = useState(product?.leatherType || "");
+  const [colorsText, setColorsText] = useState(product?.colors?.join(", ") || "");
+  const [engraving, setEngraving] = useState(product?.engravingAvailable ?? true);
+  const [instructions, setInstructions] = useState(product?.instructions || "");
+  const [existingPhotos, setExistingPhotos] = useState(product?.photos || []);
+  const [removedPhotos, setRemovedPhotos] = useState([]);
+  const [newPhotos, setNewPhotos] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const onPickFiles = (e) => {
+    const files = Array.from(e.target.files || []);
+    const added = files.map((file, i) => ({
+      key: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+      file,
+      preview: URL.createObjectURL(file),
+      label: existingPhotos.length + newPhotos.length + i === 0 ? "Main" : "Other",
+    }));
+    setNewPhotos((prev) => [...prev, ...added]);
+    e.target.value = "";
+  };
+
+  const removeExisting = (photo) => {
+    setExistingPhotos((prev) => prev.filter((p) => p.id !== photo.id));
+    setRemovedPhotos((prev) => [...prev, photo]);
+  };
+  const removeNew = (key) => setNewPhotos((prev) => prev.filter((p) => p.key !== key));
+  const setNewLabel = (key, label) => setNewPhotos((prev) => prev.map((p) => (p.key === key ? { ...p, label } : p)));
+
+  const save = async () => {
+    if (!name.trim()) { setError("Give the product a name."); return; }
+    setSaving(true);
+    setError("");
+    try {
+      await saveProduct({
+        id: product?.id,
+        fields: {
+          name: name.trim(),
+          leatherType: leatherType.trim(),
+          colors: colorsText.split(",").map((c) => c.trim()).filter(Boolean),
+          engravingAvailable: engraving,
+          instructions: instructions.trim(),
+        },
+        removedPhotos,
+        newPhotos,
+        existingCount: existingPhotos.length,
+      });
+      await onSaved();
+    } catch (e) {
+      setError(e.message || "Something went wrong. Try again.");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[55] flex justify-end" style={{ backgroundColor: "rgba(0,0,0,0.45)" }}>
+      <div className="h-full w-full md:w-[480px] overflow-y-auto" style={{ backgroundColor: TOKENS.paper }}>
+        <div className="sticky top-0 z-10 flex items-center justify-between px-4 py-3.5 border-b" style={{ borderColor: TOKENS.line, backgroundColor: TOKENS.paper }}>
+          <p className="text-base font-bold" style={{ color: TOKENS.ink }}>{editing ? "Edit product" : "Add product"}</p>
+          <button onClick={onClose} disabled={saving}><X size={19} style={{ color: TOKENS.ink }} /></button>
+        </div>
+        <div className="p-4 space-y-4 pb-10">
+          <Field label="Product name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Aviator Bag" className="input" /></Field>
+          <Field label="Leather type"><input value={leatherType} onChange={(e) => setLeatherType(e.target.value)} placeholder="e.g. Oily Pull-Up" className="input" /></Field>
+          <Field label="Available colors">
+            <input value={colorsText} onChange={(e) => setColorsText(e.target.value)} placeholder="Tan, Brown, Black" className="input" />
+            <span className="block text-[11px] mt-1" style={{ color: "#A8977F" }}>Separate colors with commas.</span>
+          </Field>
+          <div className="flex items-center justify-between rounded-xl border p-3" style={{ borderColor: TOKENS.line }}>
+            <span className="text-sm font-semibold" style={{ color: TOKENS.ink }}>Laser engraving available</span>
+            <button onClick={() => setEngraving((v) => !v)} className="rounded-full px-3 py-1 text-xs font-bold" style={{ backgroundColor: engraving ? TOKENS.status.pending.bg : TOKENS.hide, color: engraving ? TOKENS.status.pending.fg : "#8A7B65" }}>
+              {engraving ? "Yes" : "No"}
+            </button>
+          </div>
+          <Field label="Production instructions">
+            <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={5} placeholder="Anything the production team should know when making this" className="input" />
+          </Field>
+
+          <div>
+            <span className="block text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: "#8A7B65" }}>Photos</span>
+            <div className="grid grid-cols-2 gap-2">
+              {existingPhotos.map((p) => (
+                <div key={p.id} className="rounded-xl border overflow-hidden bg-white" style={{ borderColor: TOKENS.line }}>
+                  <img src={p.url} className="h-24 w-full object-cover" alt={p.label} loading="lazy" />
+                  <div className="flex items-center justify-between px-2 py-1.5">
+                    <span className="text-[11px] truncate" style={{ color: "#5A4E3F" }}>{p.label}</span>
+                    <button onClick={() => removeExisting(p)} disabled={saving}><X size={14} style={{ color: "#C24A2E" }} /></button>
+                  </div>
+                </div>
+              ))}
+              {newPhotos.map((p) => (
+                <div key={p.key} className="rounded-xl border overflow-hidden bg-white" style={{ borderColor: TOKENS.saddle }}>
+                  <img src={p.preview} className="h-24 w-full object-cover" alt="New" />
+                  <div className="flex items-center gap-1 px-1.5 py-1.5">
+                    <select value={p.label} onChange={(e) => setNewLabel(p.key, e.target.value)} className="flex-1 min-w-0 text-[11px] bg-transparent outline-none" style={{ color: "#5A4E3F" }}>
+                      {PHOTO_LABELS.map((l) => <option key={l} value={l}>{l}</option>)}
+                    </select>
+                    <button onClick={() => removeNew(p.key)} disabled={saving}><X size={14} style={{ color: "#C24A2E" }} /></button>
+                  </div>
+                </div>
+              ))}
+              <label className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed h-[132px] cursor-pointer" style={{ borderColor: TOKENS.line, color: "#8A7B65" }}>
+                <Plus size={20} />
+                <span className="text-xs font-semibold mt-1">Add photos</span>
+                <input type="file" accept="image/*" multiple onChange={onPickFiles} className="hidden" />
+              </label>
+            </div>
+            <span className="block text-[11px] mt-1.5" style={{ color: "#A8977F" }}>Photos are shrunk automatically so the app stays fast on phones.</span>
+          </div>
+
+          {error && <div className="rounded-lg px-3 py-2 text-xs font-medium" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>{error}</div>}
+
+          <div className="flex gap-2 pt-1">
+            <button onClick={onClose} disabled={saving} className="flex-1 rounded-xl border py-3 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>Cancel</button>
+            <button onClick={save} disabled={saving} className="flex-1 flex items-center justify-center gap-2 rounded-xl py-3 text-sm font-bold text-white disabled:opacity-60" style={{ backgroundColor: TOKENS.saddle }}>
+              {saving ? <><Loader2 size={16} className="animate-spin" /> Saving…</> : editing ? "Save changes" : "Add product"}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -879,20 +1285,21 @@ function ProductDetail({ product, user, onClose }) {
 
 /* ----------------------------- Custom order form ----------------------------- */
 function CustomOrderForm({ products, settings, onClose, onCreate }) {
+  const active = products.filter((p) => !p.archived);
   const [form, setForm] = useState({
-    orderNumber: "", customer: "", productId: products[0]?.id, quantity: 1,
-    color: products[0]?.colors[0], leatherType: products[0]?.leatherType || "", engravingOn: false, engravingText: "", notes: "",
+    orderNumber: "", customer: "", productId: active[0]?.id, quantity: 1,
+    color: active[0]?.colors[0] || "", leatherType: active[0]?.leatherType || "", engravingOn: false, engravingText: "", notes: "",
   });
-  const product = products.find((p) => p.id === form.productId);
+  const product = active.find((p) => p.id === form.productId);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
   const submit = () => {
-    if (!form.orderNumber || !form.customer) return;
+    if (!form.orderNumber) return;
     onCreate({
       id: `custom-${Date.now()}`,
       orderNumber: form.orderNumber,
       source: "CUSTOM",
-      customer: form.customer,
+      customer: form.customer || "Walk-in",
       orderDate: today,
       status: "pending",
       productId: form.productId,
@@ -913,12 +1320,18 @@ function CustomOrderForm({ products, settings, onClose, onCreate }) {
           <p className="text-base font-bold" style={{ color: TOKENS.ink }}>Add custom order</p>
           <button onClick={onClose}><X size={19} style={{ color: TOKENS.ink }} /></button>
         </div>
+        {active.length === 0 ? (
+          <div className="p-6 text-center">
+            <p className="text-sm font-semibold" style={{ color: TOKENS.ink }}>Add a product first</p>
+            <p className="text-xs mt-1" style={{ color: "#A8977F" }}>Custom orders pick from the Product Library, and it's empty right now. Add at least one product, then come back.</p>
+          </div>
+        ) : (
         <div className="p-4 space-y-4 pb-10">
           <Field label="Order number"><input value={form.orderNumber} onChange={(e) => set("orderNumber", e.target.value)} placeholder="e.g. 10530" className="input" /></Field>
           <Field label="Customer name (optional)"><input value={form.customer} onChange={(e) => set("customer", e.target.value)} placeholder="Walk-in — name" className="input" /></Field>
           <Field label="Product">
-            <select value={form.productId} onChange={(e) => { set("productId", e.target.value); const np = products.find(p => p.id === e.target.value); set("leatherType", np?.leatherType || ""); }} className="input">
-              {products.filter(p => !p.archived).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            <select value={form.productId} onChange={(e) => { const np = active.find(p => p.id === e.target.value); setForm((f) => ({ ...f, productId: e.target.value, leatherType: np?.leatherType || "", color: np?.colors[0] || "" })); }} className="input">
+              {active.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             </select>
           </Field>
           <Field label="Quantity"><input type="number" min={1} value={form.quantity} onChange={(e) => set("quantity", e.target.value)} className="input" /></Field>
@@ -938,8 +1351,9 @@ function CustomOrderForm({ products, settings, onClose, onCreate }) {
           {form.engravingOn && <Field label="Engraving text"><input value={form.engravingText} onChange={(e) => set("engravingText", e.target.value)} placeholder="Text to engrave" className="input" /></Field>}
           <Field label="Special instructions"><textarea value={form.notes} onChange={(e) => set("notes", e.target.value)} rows={3} className="input" /></Field>
           <p className="text-[11px]" style={{ color: "#A8977F" }}>Due date will auto-calculate: {settings.productionDays} production working days from today, once it enters production.</p>
-          <button onClick={submit} className="w-full rounded-xl py-3 text-sm font-bold text-white" style={{ backgroundColor: TOKENS.saddle }}>Create order</button>
+          <button onClick={submit} disabled={!form.orderNumber} className="w-full rounded-xl py-3 text-sm font-bold text-white disabled:opacity-40" style={{ backgroundColor: TOKENS.saddle }}>Create order</button>
         </div>
+        )}
       </div>
     </div>
   );
@@ -959,10 +1373,10 @@ function MembersPage({ user }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    fetchProfiles(user.accessToken)
+    fetchProfiles()
       .then((rows) => setMembers(rows))
       .catch(() => setError("Couldn't load members right now."));
-  }, [user.accessToken]);
+  }, [user.id]);
 
   return (
     <div className="p-4 md:p-8 max-w-2xl">
@@ -1036,15 +1450,62 @@ function AccountPage({ user }) {
 /* ----------------------------- App root ----------------------------- */
 export default function App() {
   const [user, setUser] = useState(null);
+  const [booting, setBooting] = useState(true);
   const [page, setPage] = useState("dashboard");
   const [moreOpen, setMoreOpen] = useState(false);
   const [orders, setOrders] = useState(INITIAL_ORDERS);
-  const [products] = useState(PRODUCTS);
+  const [products, setProducts] = useState([]);
+  const [productsLoading, setProductsLoading] = useState(false);
+  const [productsError, setProductsError] = useState("");
+  const [editingProduct, setEditingProduct] = useState(null); // null | "new" | product
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [initialConfirm, setInitialConfirm] = useState(null);
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [showCustomForm, setShowCustomForm] = useState(false);
+
+  // Resume a previous login (so staff aren't asked to sign in every time they open the app)
+  useEffect(() => {
+    let cancelled = false;
+    restoreSession().then((u) => {
+      if (cancelled) return;
+      if (u) setUser(u);
+      setBooting(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const refreshProducts = useCallback(async () => {
+    setProductsLoading(true);
+    setProductsError("");
+    try {
+      setProducts(await loadProducts());
+    } catch (e) {
+      setProductsError(e.message || "Couldn't load products.");
+    } finally {
+      setProductsLoading(false);
+    }
+  }, []);
+
+  // Load the real product library whenever someone is signed in
+  useEffect(() => {
+    if (user) refreshProducts();
+  }, [user, refreshProducts]);
+
+  const logout = () => {
+    supabaseSignOut();
+    setUser(null);
+    setProducts([]);
+    setSelectedProduct(null);
+    setEditingProduct(null);
+    setSelectedOrder(null);
+    setPage("dashboard");
+  };
+
+  const toggleArchive = async (product) => {
+    await setProductArchived(product.id, !product.archived);
+    await refreshProducts();
+  };
 
   const advanceOrder = useCallback((orderId, newStatus, event, by) => {
     setOrders((prev) => prev.map((o) => {
@@ -1078,14 +1539,24 @@ export default function App() {
     return o;
   }), [orders, settings]);
 
+  if (booting) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ backgroundColor: TOKENS.ink }}>
+        <Loader2 size={22} className="animate-spin" style={{ color: "#C9BCA8" }} />
+      </div>
+    );
+  }
   if (!user) return <LoginScreen onLogin={setUser} />;
 
-  const productFor = (o) => products.find((p) => p.id === o.productId);
+  // Orders can point at real products or (until orders move to the database) the demo ones
+  const lookupProducts = [...products, ...SAMPLE_PRODUCTS];
+  const productFor = (o) => lookupProducts.find((p) => p.id === o.productId);
+  const freshSelectedProduct = selectedProduct ? (products.find((p) => p.id === selectedProduct.id) || selectedProduct) : null;
 
   let content;
   if (page === "dashboard") content = <Dashboard orders={ordersComputed} setPage={setPage} settings={settings} user={user} />;
-  else if (["pending", "production", "completed", "dispatched", "delivered"].includes(page)) content = <OrderListPage status={page} orders={ordersComputed} products={products} onOpen={(o) => { setSelectedOrder(o); setInitialConfirm(null); }} onStartProduction={(o) => advanceOrder(o.id, "production", "Started production", user.name)} onQuickAction={(o, action) => { setSelectedOrder(o); setInitialConfirm(action); }} />;
-  else if (page === "products") content = <ProductsPage products={products} user={user} onOpenProduct={setSelectedProduct} />;
+  else if (["pending", "production", "completed", "dispatched", "delivered"].includes(page)) content = <OrderListPage status={page} orders={ordersComputed} products={lookupProducts} onOpen={(o) => { setSelectedOrder(o); setInitialConfirm(null); }} onStartProduction={(o) => advanceOrder(o.id, "production", "Started production", user.name)} onQuickAction={(o, action) => { setSelectedOrder(o); setInitialConfirm(action); }} />;
+  else if (page === "products") content = <ProductsPage products={products} loading={productsLoading} error={productsError} user={user} onOpenProduct={setSelectedProduct} onAdd={() => setEditingProduct("new")} onRetry={refreshProducts} />;
   else if (page === "members" && user.role === "owner") content = <MembersPage user={user} />;
   else if (page === "settings" && user.role === "owner") content = <SettingsPage settings={settings} setSettings={setSettings} />;
   else if (page === "account") content = <AccountPage user={user} />;
@@ -1094,13 +1565,13 @@ export default function App() {
   return (
     <div className="flex min-h-screen" style={{ backgroundColor: TOKENS.paper, fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif" }}>
       <style>{`.input { width:100%; border-radius:0.75rem; border:1px solid ${TOKENS.line}; padding:0.6rem 0.75rem; font-size:0.875rem; outline:none; background:white; color:${TOKENS.ink}; }`}</style>
-      <SidebarNav page={page} setPage={setPage} user={user} onLogout={() => { supabaseSignOut(user.accessToken); setUser(null); }} />
+      <SidebarNav page={page} setPage={setPage} user={user} onLogout={logout} />
       <div className="flex-1 min-w-0 flex flex-col">
-        <MobileTopBar user={user} onLogout={() => { supabaseSignOut(user.accessToken); setUser(null); }} />
+        <MobileTopBar user={user} onLogout={logout} />
         <div className="flex-1 pb-20 md:pb-0">{content}</div>
       </div>
 
-      {user.role === "owner" && page !== "account" && !selectedOrder && !selectedProduct && (
+      {user.role === "owner" && page !== "account" && !selectedOrder && !selectedProduct && !editingProduct && (
         <button onClick={() => setShowCustomForm(true)} className="fixed bottom-20 md:bottom-6 right-4 md:right-8 flex items-center gap-1.5 rounded-full px-4 py-3 text-sm font-bold text-white shadow-lg z-30" style={{ backgroundColor: TOKENS.saddle }}>
           <Plus size={16} /> Custom order
         </button>
@@ -1112,7 +1583,22 @@ export default function App() {
       {selectedOrder && (
         <OrderDetail order={ordersComputed.find(o => o.id === selectedOrder.id) || selectedOrder} product={productFor(selectedOrder)} user={user} onClose={() => { setSelectedOrder(null); setInitialConfirm(null); }} onAdvance={advanceOrder} onUpdate={updateOrder} initialConfirm={initialConfirm} />
       )}
-      {selectedProduct && <ProductDetail product={selectedProduct} user={user} onClose={() => setSelectedProduct(null)} />}
+      {freshSelectedProduct && (
+        <ProductDetail
+          product={freshSelectedProduct}
+          user={user}
+          onClose={() => setSelectedProduct(null)}
+          onEdit={(p) => setEditingProduct(p)}
+          onToggleArchive={toggleArchive}
+        />
+      )}
+      {editingProduct && (
+        <ProductForm
+          product={editingProduct === "new" ? null : editingProduct}
+          onClose={() => setEditingProduct(null)}
+          onSaved={async () => { await refreshProducts(); setEditingProduct(null); }}
+        />
+      )}
       {showCustomForm && <CustomOrderForm products={products} settings={settings} onClose={() => setShowCustomForm(false)} onCreate={createCustomOrder} />}
     </div>
   );
