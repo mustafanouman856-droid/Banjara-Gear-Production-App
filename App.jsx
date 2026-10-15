@@ -256,7 +256,7 @@ async function setProductArchived(id, archived) {
 }
 
 /* ----------------------------- Order data ----------------------------- */
-const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at";
+const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at,cancelled_at";
 const ACTIVE_STATUSES = "pending,production,completed,dispatched";
 const DELIVERED_PAGE = 30;
 
@@ -278,6 +278,7 @@ function mapOrder(row) {
     engraving: { on: !!row.engraving_on, text: row.engraving_text || "" },
     notes: row.notes || "",
     createdAt: row.created_at,
+    cancelledAt: row.cancelled_at || null,
   };
 }
 
@@ -779,6 +780,7 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
 
   const overdue = orders.filter((o) => o.status === "production" && o.dueDate && o.dueDate < today).length;
   const dueToday = orders.filter((o) => o.status === "production" && o.dueDate === today).length;
+  const cancelledOrders = orders.filter((o) => o.cancelledAt && o.status !== "delivered").length;
   const engravingOrders = orders.filter((o) => o.engraving.on && (o.status === "pending" || o.status === "production")).length;
 
   const cards = [
@@ -812,6 +814,12 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
         <div className="rounded-2xl border p-4" style={{ borderColor: TOKENS.line }}>
           <p className="text-xs font-semibold uppercase tracking-wide mb-3" style={{ color: "#8A7B65" }}>Needs attention</p>
           <div className="space-y-2.5">
+            {cancelledOrders > 0 && (
+              <button onClick={() => setPage("pending")} className="w-full flex items-center justify-between text-sm">
+                <span className="flex items-center gap-2 font-semibold" style={{ color: "#C24A2E" }}><X size={15} /> Cancelled in Shopify — don't make</span>
+                <span className="font-bold" style={{ color: "#C24A2E" }}>{cancelledOrders}</span>
+              </button>
+            )}
             <button onClick={() => setPage("production")} className="w-full flex items-center justify-between text-sm">
               <span className="flex items-center gap-2" style={{ color: TOKENS.ink }}><AlertTriangle size={15} style={{ color: "#C24A2E" }} /> Overdue in production</span>
               <span className="font-bold" style={{ color: overdue ? "#C24A2E" : "#8A7B65" }}>{overdue}</span>
@@ -842,18 +850,20 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
 
 /* ----------------------------- Order list ----------------------------- */
 function OrderRow({ order, productName, isOwner, onOpen, onStartProduction, onQuickAction, busy }) {
-  const isOverdue = order.status === "production" && !!order.dueDate && order.dueDate < todayISO();
+  const cancelled = !!order.cancelledAt;
+  const isOverdue = !cancelled && order.status === "production" && !!order.dueDate && order.dueDate < todayISO();
   const hoursWaiting = order.status === "pending" && order.createdAt
     ? Math.max(0, Math.floor((Date.now() - new Date(order.createdAt).getTime()) / 36e5)) : 0;
-  const quickKey = isOwner ? (order.status === "completed" ? "dispatch" : order.status === "dispatched" ? "deliver" : null) : null;
+  const quickKey = isOwner && !cancelled ? (order.status === "completed" ? "dispatch" : order.status === "dispatched" ? "deliver" : null) : null;
   const quick = quickKey ? ORDER_ACTIONS[quickKey] : null;
   return (
-    <div className="w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition hover:shadow-sm" style={{ borderColor: isOverdue ? "#E3B2A0" : TOKENS.line, backgroundColor: isOverdue ? "#FDF4F1" : "white" }}>
+    <div className="w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition hover:shadow-sm" style={{ borderColor: isOverdue || cancelled ? "#E3B2A0" : TOKENS.line, backgroundColor: isOverdue || cancelled ? "#FDF4F1" : "white" }}>
       <button onClick={() => onOpen(order)} className="flex-1 min-w-0 text-left">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>#{order.orderNumber}</p>
           <SourceTag source={order.source} />
           <EngravingTag engraving={order.engraving} />
+          {cancelled && <span className="rounded-full px-2 py-0.5 text-[11px] font-bold text-white" style={{ backgroundColor: "#C24A2E" }}>CANCELLED · don't make</span>}
         </div>
         <p className="text-sm mt-0.5 truncate" style={{ color: "#5A4E3F" }}>{productName} · Qty {order.quantity}{order.color ? ` · ${order.color}` : ""}</p>
         <p className="text-xs mt-1" style={{ color: isOverdue ? "#C24A2E" : "#A8977F" }}>
@@ -864,7 +874,7 @@ function OrderRow({ order, productName, isOwner, onOpen, onStartProduction, onQu
               : `Ordered ${fmt(order.orderDate)}`}
         </p>
       </button>
-      {order.status === "pending" && onStartProduction && (
+      {order.status === "pending" && !cancelled && onStartProduction && (
         <button onClick={() => onStartProduction(order)} disabled={busy} className="shrink-0 rounded-lg px-3 py-2 text-xs font-bold text-white disabled:opacity-50" style={{ backgroundColor: TOKENS.status.production.fg }}>
           {busy ? "Starting…" : "Start Production"}
         </button>
@@ -874,7 +884,7 @@ function OrderRow({ order, productName, isOwner, onOpen, onStartProduction, onQu
           {quick.rowLabel}
         </button>
       )}
-      {order.status !== "pending" && !quick && <button onClick={() => onOpen(order)}><ChevronRight size={18} style={{ color: "#C9BCA8" }} className="shrink-0" /></button>}
+      {(order.status !== "pending" || cancelled) && !quick && <button onClick={() => onOpen(order)}><ChevronRight size={18} style={{ color: "#C9BCA8" }} className="shrink-0" /></button>}
     </div>
   );
 }
@@ -1062,7 +1072,8 @@ function OrderDetail({ order, product, productName, user, onClose, onAdvance, on
   const isOwner = user.role === "owner";
   const actionKey = nextActionKey(order.status);
   const action = actionKey ? ORDER_ACTIONS[actionKey] : null;
-  const allowed = canDoAction(actionKey, user.role);
+  const cancelled = !!order.cancelledAt;
+  const allowed = !cancelled && canDoAction(actionKey, user.role);
 
   const [confirming, setConfirming] = useState(initialConfirm || null);
   const [busy, setBusy] = useState(false);
@@ -1200,6 +1211,12 @@ function OrderDetail({ order, product, productName, user, onClose, onAdvance, on
             <EngravingTag engraving={order.engraving} />
             {isOverdue && <span className="text-xs font-bold" style={{ color: "#C24A2E" }}>Overdue</span>}
           </div>
+
+          {cancelled && (
+            <div className="rounded-xl px-3 py-2.5 text-sm font-semibold" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>
+              This order was cancelled in Shopify. Do not make or ship it.{isOwner ? " You can delete it below once you've checked." : " Please tell the owner."}
+            </div>
+          )}
 
           {!editing && (
             <>
