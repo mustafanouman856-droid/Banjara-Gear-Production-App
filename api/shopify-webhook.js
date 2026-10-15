@@ -1,4 +1,5 @@
-// Receives "Order creation" webhooks from Shopify and adds them to Pending.
+// Receives Shopify webhooks: "Order creation" adds the order to Pending,
+// "Order cancellation" marks it cancelled so nobody makes it by mistake.
 // Secrets live in Vercel Environment Variables, never in this file:
 //   SHOPIFY_WEBHOOK_SECRET  - the signing secret shown in Shopify's Webhooks section
 //   SUPABASE_SECRET_KEY     - the Supabase secret key (server-side only)
@@ -34,8 +35,12 @@ function pkDate(iso) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi" }).format(d);
 }
 
+export function baseNumber(order) {
+  return String(order.name || order.order_number || order.id).replace(/^#/, "");
+}
+
 export function buildRows(order) {
-  const base = String(order.name || order.order_number || order.id).replace(/^#/, "");
+  const base = baseNumber(order);
   const items = order.line_items || [];
   const c = order.customer || {};
   const ship = order.shipping_address || {};
@@ -83,7 +88,25 @@ export default async function handler(req, res) {
   let order;
   try { order = JSON.parse(raw.toString("utf8")); } catch (e) { return res.status(400).send("Bad JSON"); }
 
+  const topic = String(req.headers["x-shopify-topic"] || "");
+
   try {
+    if (topic === "orders/cancelled") {
+      // Matches the order itself (1055) and its lines (1055-1, 1055-2), nothing else
+      const base = baseNumber(order).replace(/[^\w-]/g, "");
+      const filter = `or=(order_number.eq.${base},order_number.like.${base}-*)&cancelled_at=is.null`;
+      const upd = await fetch(`${SUPABASE_URL}/rest/v1/orders?${filter}`, {
+        method: "PATCH",
+        headers: dbHeaders(key, { Prefer: "return=minimal" }),
+        body: JSON.stringify({ cancelled_at: new Date().toISOString() }),
+      });
+      if (!upd.ok) {
+        console.error("Cancel failed", upd.status, await upd.text());
+        return res.status(500).send("Could not save cancellation"); // Shopify will retry
+      }
+      return res.status(200).send("OK");
+    }
+
     const rows = buildRows(order);
     if (!rows.length) return res.status(200).send("No items");
 
