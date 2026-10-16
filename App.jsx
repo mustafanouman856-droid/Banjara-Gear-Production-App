@@ -472,10 +472,26 @@ const fmtDateTime = (iso) => {
   return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 };
 
+// Working-day maths for estimates shown on the screen (the database does the real due dates)
+const addWorkingDaysISO = (startISO, n, days) => {
+  const d = parseDate(startISO);
+  if (!days || !days.length) { d.setDate(d.getDate() + n); return toISODate(d); }
+  let added = 0, guard = 0;
+  while (added < n && guard < 1000) {
+    d.setDate(d.getDate() + 1);
+    guard += 1;
+    if (days.includes(d.getDay())) added += 1;
+  }
+  return toISODate(d);
+};
+const hoursSince = (iso) => (iso ? Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 36e5)) : 0);
+const waitLabel = (h) => (h < 48 ? `${h}h` : `${Math.floor(h / 24)}d ${h % 24}h`);
+const WAIT_WARN_HOURS = 24;
+const WAIT_LATE_HOURS = 48;
 const DEFAULT_SETTINGS = { productionDays: 3, courierDays: 3, workingDays: [1, 2, 3, 4, 5, 6] }; // Mon-Sat
 
 const STATUS_META = {
-  pending:    { label: "Pending",    icon: Clock,        nav: "Pending" },
+  pending:    { label: "New orders", icon: Clock,        nav: "New orders" },
   production: { label: "Production", icon: Factory,      nav: "Production" },
   completed:  { label: "Completed",  icon: CheckCircle2, nav: "Completed" },
   dispatched: { label: "Dispatched", icon: Truck,         nav: "Dispatched" },
@@ -625,7 +641,7 @@ function LoginScreen({ onLogin }) {
 /* ----------------------------- Navigation ----------------------------- */
 const NAV_ITEMS = [
   { key: "dashboard", label: "Dashboard", icon: Home, roles: ["owner", "production"] },
-  { key: "pending", label: "Pending", icon: Clock, roles: ["owner", "production"] },
+  { key: "pending", label: "New orders", icon: Clock, roles: ["owner", "production"] },
   { key: "production", label: "Production", icon: Factory, roles: ["owner", "production"] },
   { key: "completed", label: "Completed", icon: CheckCircle2, roles: ["owner", "production"] },
   { key: "dispatched", label: "Dispatched", icon: Truck, roles: ["owner", "production"] },
@@ -751,7 +767,7 @@ function MoreSheet({ open, onClose, page, setPage, user }) {
 const ORDER_ACTIONS = {
   start: {
     to: "production", ownerOnly: false, button: "Start Production", rowLabel: "Start Production",
-    confirm: (n) => `Start production on #${n}?`, question: "This moves the order out of Pending and into the Production queue now.",
+    confirm: (n) => `Start production on #${n}?`, question: "This moves the order out of New orders and into the Production queue now.",
     tone: TOKENS.status.production.fg,
   },
   complete: {
@@ -780,11 +796,12 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
 
   const overdue = orders.filter((o) => o.status === "production" && o.dueDate && o.dueDate < today).length;
   const dueToday = orders.filter((o) => o.status === "production" && o.dueDate === today).length;
+  const waitingLong = orders.filter((o) => o.status === "pending" && !o.cancelledAt && hoursSince(o.createdAt) >= WAIT_WARN_HOURS).length;
   const cancelledOrders = orders.filter((o) => o.cancelledAt && o.status !== "delivered").length;
   const engravingOrders = orders.filter((o) => o.engraving.on && (o.status === "pending" || o.status === "production")).length;
 
   const cards = [
-    { key: "pending", label: "Pending", icon: Clock },
+    { key: "pending", label: "New orders", icon: Clock },
     { key: "production", label: "Production", icon: Factory },
     { key: "completed", label: "Completed", icon: CheckCircle2 },
     { key: "dispatched", label: "Dispatched", icon: Truck },
@@ -814,6 +831,12 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
         <div className="rounded-2xl border p-4" style={{ borderColor: TOKENS.line }}>
           <p className="text-xs font-semibold uppercase tracking-wide mb-3" style={{ color: "#8A7B65" }}>Needs attention</p>
           <div className="space-y-2.5">
+            {waitingLong > 0 && (
+              <button onClick={() => setPage("pending")} className="w-full flex items-center justify-between text-sm">
+                <span className="flex items-center gap-2 font-semibold" style={{ color: "#9A5A12" }}><AlertTriangle size={15} /> New orders waiting over 24h</span>
+                <span className="font-bold" style={{ color: "#9A5A12" }}>{waitingLong}</span>
+              </button>
+            )}
             {cancelledOrders > 0 && (
               <button onClick={() => setPage("pending")} className="w-full flex items-center justify-between text-sm">
                 <span className="flex items-center gap-2 font-semibold" style={{ color: "#C24A2E" }}><X size={15} /> Cancelled in Shopify — don't make</span>
@@ -849,15 +872,19 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
 }
 
 /* ----------------------------- Order list ----------------------------- */
-function OrderRow({ order, productName, isOwner, onOpen, onStartProduction, onQuickAction, busy }) {
+function OrderRow({ order, productName, isOwner, settings, onOpen, onStartProduction, onQuickAction, busy }) {
   const cancelled = !!order.cancelledAt;
   const isOverdue = !cancelled && order.status === "production" && !!order.dueDate && order.dueDate < todayISO();
-  const hoursWaiting = order.status === "pending" && order.createdAt
-    ? Math.max(0, Math.floor((Date.now() - new Date(order.createdAt).getTime()) / 36e5)) : 0;
+  const hoursWaiting = order.status === "pending" ? hoursSince(order.createdAt) : 0;
+  const waitLevel = order.status === "pending" && !cancelled ? (hoursWaiting >= WAIT_LATE_HOURS ? "late" : hoursWaiting >= WAIT_WARN_HOURS ? "warn" : "ok") : "ok";
+  const estDue = order.status === "pending" && settings ? addWorkingDaysISO(todayISO(), settings.productionDays, settings.workingDays) : null;
   const quickKey = isOwner && !cancelled ? (order.status === "completed" ? "dispatch" : order.status === "dispatched" ? "deliver" : null) : null;
   const quick = quickKey ? ORDER_ACTIONS[quickKey] : null;
   return (
-    <div className="w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition hover:shadow-sm" style={{ borderColor: isOverdue || cancelled ? "#E3B2A0" : TOKENS.line, backgroundColor: isOverdue || cancelled ? "#FDF4F1" : "white" }}>
+    <div className="w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition hover:shadow-sm" style={{
+      borderColor: isOverdue || cancelled || waitLevel === "late" ? "#E3B2A0" : waitLevel === "warn" ? "#E8CFA0" : TOKENS.line,
+      backgroundColor: isOverdue || cancelled || waitLevel === "late" ? "#FDF4F1" : waitLevel === "warn" ? "#FDF8EC" : "white",
+    }}>
       <button onClick={() => onOpen(order)} className="flex-1 min-w-0 text-left">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>#{order.orderNumber}</p>
@@ -870,9 +897,17 @@ function OrderRow({ order, productName, isOwner, onOpen, onStartProduction, onQu
           {order.status === "production"
             ? `Due ${fmt(order.dueDate)}${isOverdue ? " · overdue" : ""}`
             : order.status === "pending"
-              ? `Waiting ${hoursWaiting}h · entered ${fmt(order.orderDate)}`
+              ? `Waiting ${waitLabel(hoursWaiting)} · entered ${fmt(order.orderDate)}`
               : `Ordered ${fmt(order.orderDate)}`}
         </p>
+        {order.status === "pending" && !cancelled && (
+          <p className="text-xs mt-0.5" style={{ color: "#A8977F" }}>Est. due {fmt(estDue)} if started today</p>
+        )}
+        {waitLevel !== "ok" && (
+          <p className="text-xs mt-1 font-bold flex items-center gap-1" style={{ color: waitLevel === "late" ? "#C24A2E" : "#9A5A12" }}>
+            <AlertTriangle size={12} /> Not started after {waitLabel(hoursWaiting)} — start production
+          </p>
+        )}
       </button>
       {order.status === "pending" && !cancelled && onStartProduction && (
         <button onClick={() => onStartProduction(order)} disabled={busy} className="shrink-0 rounded-lg px-3 py-2 text-xs font-bold text-white disabled:opacity-50" style={{ backgroundColor: TOKENS.status.production.fg }}>
@@ -898,7 +933,7 @@ function ListSearch({ value, onChange }) {
   );
 }
 
-function OrderListPage({ status, orders, productNameFor, isOwner, loading, error, onRetry, onOpen, onStartProduction, onQuickAction, busyId }) {
+function OrderListPage({ status, orders, productNameFor, isOwner, settings, loading, error, onRetry, onOpen, onStartProduction, onQuickAction, busyId }) {
   const [q, setQ] = useState("");
   const [engravingOnly, setEngravingOnly] = useState(false);
   const meta = STATUS_META[status];
@@ -922,7 +957,7 @@ function OrderListPage({ status, orders, productNameFor, isOwner, loading, error
         <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ backgroundColor: TOKENS.hide, color: "#8A7B65" }}>{list.length}</span>
       </div>
       {status === "pending" && (
-        <p className="mt-2 text-xs" style={{ color: "#A8977F" }}>Orders normally move to Production automatically after 24 hours. Anyone can start one early.</p>
+        <p className="mt-2 text-xs" style={{ color: "#A8977F" }}>New orders from Shopify and custom orders. Tap Start Production when work begins. Orders waiting more than 24 hours are flagged.</p>
       )}
       <div className="mt-4"><ListSearch value={q} onChange={setQ} /></div>
       <div className="mt-2.5">
@@ -939,7 +974,7 @@ function OrderListPage({ status, orders, productNameFor, isOwner, loading, error
         {loading && orders.length === 0 && <p className="text-sm py-10 text-center" style={{ color: "#A8977F" }}>Loading orders…</p>}
         {!loading && !error && list.length === 0 && <p className="text-sm py-10 text-center" style={{ color: "#A8977F" }}>{needle || engravingOnly ? "No orders match." : "Nothing here right now."}</p>}
         {list.map((o) => (
-          <OrderRow key={o.id} order={o} productName={productNameFor(o)} isOwner={isOwner} busy={busyId === o.id}
+          <OrderRow key={o.id} order={o} productName={productNameFor(o)} isOwner={isOwner} settings={settings} busy={busyId === o.id}
             onOpen={onOpen} onStartProduction={onStartProduction} onQuickAction={onQuickAction} />
         ))}
       </div>
@@ -1068,7 +1103,7 @@ function PhotoGrid({ photos, onRemove }) {
   );
 }
 
-function OrderDetail({ order, product, productName, user, onClose, onAdvance, onSave, onDelete, initialConfirm }) {
+function OrderDetail({ order, product, productName, settings, user, onClose, onAdvance, onSave, onDelete, initialConfirm }) {
   const isOwner = user.role === "owner";
   const actionKey = nextActionKey(order.status);
   const action = actionKey ? ORDER_ACTIONS[actionKey] : null;
@@ -1212,6 +1247,11 @@ function OrderDetail({ order, product, productName, user, onClose, onAdvance, on
             {isOverdue && <span className="text-xs font-bold" style={{ color: "#C24A2E" }}>Overdue</span>}
           </div>
 
+          {order.status === "pending" && !cancelled && hoursSince(order.createdAt) >= WAIT_WARN_HOURS && (
+            <div className="rounded-xl px-3 py-2.5 text-sm font-semibold" style={{ backgroundColor: "#FBEAD3", color: "#9A5A12" }}>
+              This order has been waiting {waitLabel(hoursSince(order.createdAt))} without starting production.
+            </div>
+          )}
           {cancelled && (
             <div className="rounded-xl px-3 py-2.5 text-sm font-semibold" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>
               This order was cancelled in Shopify. Do not make or ship it.{isOwner ? " You can delete it below once you've checked." : " Please tell the owner."}
@@ -1222,7 +1262,7 @@ function OrderDetail({ order, product, productName, user, onClose, onAdvance, on
             <>
               <Section title="Order information">
                 <Row label="Order date" value={`${fmt(order.orderDate)} (${dayName(order.orderDate)})`} />
-                <Row label="Due / production date" value={order.dueDate ? `${fmt(order.dueDate)} (${dayName(order.dueDate)})` : "—"} />
+                <Row label="Due / production date" value={order.dueDate ? `${fmt(order.dueDate)} (${dayName(order.dueDate)})` : order.status === "pending" && settings ? `Set when production starts (est. ${fmt(addWorkingDaysISO(todayISO(), settings.productionDays, settings.workingDays))})` : "—"} />
                 <Row label="Expected delivery" value={order.expectedDelivery ? `${fmt(order.expectedDelivery)} (${dayName(order.expectedDelivery)})` : "—"} />
                 <Row label="Customer" value={order.customer || "—"} />
                 <Row label="Source" value={order.source} />
@@ -2041,7 +2081,7 @@ export default function App() {
   const freshSelectedProduct = selectedProduct ? (products.find((p) => p.id === selectedProduct.id) || selectedProduct) : null;
   const openOrder = (o) => { setSelectedOrder(o); setInitialConfirm(null); };
   const listProps = {
-    productNameFor, isOwner, onOpen: openOrder,
+    productNameFor, isOwner, settings, onOpen: openOrder,
     onStartProduction: (o) => advanceFromList(o, "production"),
     onQuickAction: (o, action) => { setSelectedOrder(o); setInitialConfirm(action); },
     busyId,
@@ -2089,6 +2129,7 @@ export default function App() {
           order={liveSelected}
           product={productFor(liveSelected)}
           productName={productNameFor(liveSelected)}
+          settings={settings}
           user={user}
           onClose={() => { setSelectedOrder(null); setInitialConfirm(null); }}
           onAdvance={advanceOrder}
