@@ -256,7 +256,7 @@ async function setProductArchived(id, archived) {
 }
 
 /* ----------------------------- Order data ----------------------------- */
-const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at,cancelled_at,channel";
+const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at,cancelled_at,channel,held_at,hold_reason,production_started_at";
 const ACTIVE_STATUSES = "pending,production,completed,dispatched";
 const DELIVERED_PAGE = 30;
 
@@ -280,6 +280,9 @@ function mapOrder(row) {
     createdAt: row.created_at,
     cancelledAt: row.cancelled_at || null,
     channel: row.channel || "",
+    heldAt: row.held_at || null,
+    holdReason: row.hold_reason || "",
+    startedAt: row.production_started_at || null,
   };
 }
 
@@ -375,6 +378,23 @@ async function advanceOrderStatus(orderId, fromStatus, toStatus) {
   const rows = await res.json();
   if (!rows.length) {
     const err = new Error("Someone else already updated this order. The list has been refreshed.");
+    err.code = "CONFLICT";
+    throw err;
+  }
+  return mapOrder(rows[0]);
+}
+
+// Put an order on hold (with a reason) or take it off hold. Only works while it is in production.
+async function setOrderHold(orderId, reason) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/orders?id=eq.${orderId}&status=eq.production&select=${ORDER_COLUMNS}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify(reason ? { held_at: new Date().toISOString(), hold_reason: reason } : { held_at: null, hold_reason: null }),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't update the order."));
+  const rows = await res.json();
+  if (!rows.length) {
+    const err = new Error("This order is no longer in production. The list has been refreshed.");
     err.code = "CONFLICT";
     throw err;
   }
@@ -800,6 +820,7 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
   const overdue = orders.filter((o) => o.status === "production" && o.dueDate && o.dueDate < today).length;
   const dueToday = orders.filter((o) => o.status === "production" && o.dueDate === today).length;
   const waitingLong = orders.filter((o) => o.status === "pending" && !o.cancelledAt && hoursSince(o.createdAt) >= WAIT_WARN_HOURS).length;
+  const heldOrders = orders.filter((o) => o.status === "production" && o.heldAt && !o.cancelledAt).length;
   const cancelledOrders = orders.filter((o) => o.cancelledAt && o.status !== "delivered").length;
   const engravingOrders = orders.filter((o) => o.engraving.on && (o.status === "pending" || o.status === "production")).length;
 
@@ -838,6 +859,12 @@ function Dashboard({ orders, stats, setPage, settings, user }) {
               <button onClick={() => setPage("pending")} className="w-full flex items-center justify-between text-sm">
                 <span className="flex items-center gap-2 font-semibold" style={{ color: "#9A5A12" }}><AlertTriangle size={15} /> New orders waiting over 24h</span>
                 <span className="font-bold" style={{ color: "#9A5A12" }}>{waitingLong}</span>
+              </button>
+            )}
+            {heldOrders > 0 && (
+              <button onClick={() => setPage("production")} className="w-full flex items-center justify-between text-sm">
+                <span className="flex items-center gap-2 font-semibold" style={{ color: TOKENS.ink }}><Clock size={15} /> On hold in production</span>
+                <span className="font-bold" style={{ color: TOKENS.ink }}>{heldOrders}</span>
               </button>
             )}
             {cancelledOrders > 0 && (
@@ -894,6 +921,7 @@ function OrderRow({ order, productName, isOwner, settings, onOpen, onStartProduc
           <SourceTag source={order.source} />
           <EngravingTag engraving={order.engraving} />
           {cancelled && <span className="rounded-full px-2 py-0.5 text-[11px] font-bold text-white" style={{ backgroundColor: "#C24A2E" }}>CANCELLED · don't make</span>}
+          {order.heldAt && !cancelled && <span className="rounded-full px-2 py-0.5 text-[11px] font-bold text-white" style={{ backgroundColor: TOKENS.ink }}>ON HOLD</span>}
         </div>
         <p className="text-sm mt-0.5 truncate" style={{ color: "#5A4E3F" }}>{productName} · Qty {order.quantity}{order.color ? ` · ${order.color}` : ""}</p>
         <p className="text-xs mt-1" style={{ color: isOverdue ? "#C24A2E" : "#A8977F" }}>
@@ -903,6 +931,7 @@ function OrderRow({ order, productName, isOwner, settings, onOpen, onStartProduc
               ? `Waiting ${waitLabel(hoursWaiting)} · entered ${fmt(order.orderDate)}`
               : `Ordered ${fmt(order.orderDate)}`}
         </p>
+        {order.heldAt && !cancelled && <p className="text-xs mt-0.5 font-semibold" style={{ color: TOKENS.ink }}>Reason: {order.holdReason}</p>}
         {order.status === "pending" && !cancelled && (
           <p className="text-xs mt-0.5" style={{ color: "#A8977F" }}>Est. due {fmt(estDue)} if started today</p>
         )}
@@ -1106,12 +1135,13 @@ function PhotoGrid({ photos, onRemove }) {
   );
 }
 
-function OrderDetail({ order, product, productName, settings, user, onClose, onAdvance, onSave, onDelete, initialConfirm }) {
+function OrderDetail({ order, product, productName, settings, user, onClose, onAdvance, onHold, onSave, onDelete, initialConfirm }) {
   const isOwner = user.role === "owner";
   const actionKey = nextActionKey(order.status);
   const action = actionKey ? ORDER_ACTIONS[actionKey] : null;
   const cancelled = !!order.cancelledAt;
-  const allowed = !cancelled && canDoAction(actionKey, user.role);
+  const onHoldNow = !!order.heldAt;
+  const allowed = !cancelled && !onHoldNow && canDoAction(actionKey, user.role);
 
   const [confirming, setConfirming] = useState(initialConfirm || null);
   const [busy, setBusy] = useState(false);
@@ -1126,6 +1156,9 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
   const [uploading, setUploading] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [holdOpen, setHoldOpen] = useState(false);
+  const [holdReason, setHoldReason] = useState("");
+  const [holdBusy, setHoldBusy] = useState(false);
 
   const isOverdue = order.status === "production" && !!order.dueDate && order.dueDate < todayISO();
   const leatherType = order.leatherType || product?.leatherType || "—";
@@ -1151,6 +1184,20 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
     } finally {
       setConfirming(null);
       setBusy(false);
+    }
+  };
+
+  const submitHold = async (reason) => {
+    setHoldBusy(true);
+    setError("");
+    try {
+      await onHold(order, reason);
+      setHoldOpen(false);
+      setHoldReason("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setHoldBusy(false);
     }
   };
 
@@ -1251,6 +1298,36 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
             {isOverdue && <span className="text-xs font-bold" style={{ color: "#C24A2E" }}>Overdue</span>}
           </div>
 
+          {order.status === "production" && !cancelled && (
+            <Section title="Production status">
+              {onHoldNow ? (
+                <div>
+                  <span className="inline-block rounded px-2 py-0.5 text-xs font-bold text-white" style={{ backgroundColor: TOKENS.ink }}>ON HOLD</span>
+                  <p className="mt-2 text-sm font-semibold" style={{ color: TOKENS.ink }}>{order.holdReason}</p>
+                  <p className="mt-0.5 text-[11px]" style={{ color: "#A8977F" }}>Since {fmtDateTime(order.heldAt)}. Mark it ready when work can continue.</p>
+                  <button onClick={() => submitHold("")} disabled={holdBusy} className="mt-3 w-full rounded-xl py-2.5 text-sm font-bold text-white disabled:opacity-50" style={{ backgroundColor: TOKENS.status.production.fg }}>
+                    {holdBusy ? "Saving…" : "Ready — resume production"}
+                  </button>
+                </div>
+              ) : holdOpen ? (
+                <div>
+                  <p className="text-sm font-semibold" style={{ color: TOKENS.ink }}>Why is this order on hold?</p>
+                  <textarea value={holdReason} onChange={(e) => setHoldReason(e.target.value)} rows={2} placeholder="e.g. Waiting for leather stock" className="input mt-2" />
+                  <div className="mt-2 flex gap-2">
+                    <button onClick={() => { setHoldOpen(false); setHoldReason(""); }} disabled={holdBusy} className="flex-1 rounded-lg border py-2 text-sm font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>Cancel</button>
+                    <button onClick={() => submitHold(holdReason.trim())} disabled={holdBusy || !holdReason.trim()} className="flex-1 rounded-lg py-2 text-sm font-semibold text-white disabled:opacity-40" style={{ backgroundColor: TOKENS.ink }}>
+                      {holdBusy ? "Saving…" : "Put on hold"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm" style={{ color: "#5A4E3F" }}>In progress.</p>
+                  <button onClick={() => setHoldOpen(true)} className="rounded-lg border px-3 py-1.5 text-xs font-bold" style={{ borderColor: TOKENS.ink, color: TOKENS.ink }}>Put on hold</button>
+                </div>
+              )}
+            </Section>
+          )}
           {order.status === "pending" && !cancelled && hoursSince(order.createdAt) >= WAIT_WARN_HOURS && (
             <div className="rounded-xl px-3 py-2.5 text-sm font-semibold" style={{ backgroundColor: "#FBEAD3", color: "#9A5A12" }}>
               This order has been waiting {waitLabel(hoursSince(order.createdAt))} without starting production.
@@ -1386,6 +1463,9 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
 
         <div className="sticky bottom-0 p-4 border-t" style={{ borderColor: TOKENS.line, backgroundColor: TOKENS.paper }}>
           {error && <div className="mb-3 rounded-lg px-3 py-2 text-xs font-medium" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>{error}</div>}
+          {action && !cancelled && onHoldNow && canDoAction(actionKey, user.role) && (
+            <p className="text-xs text-center font-medium" style={{ color: "#9A5A12" }}>This order is on hold. Mark it ready before completing it.</p>
+          )}
           {action && allowed && confirming !== actionKey && (
             <button onClick={() => setConfirming(actionKey)} disabled={editing} className="w-full rounded-xl py-3 text-sm font-bold text-white disabled:opacity-50" style={{ backgroundColor: action.tone }}>
               {action.button}
@@ -1743,33 +1823,61 @@ function printableOrders(orders, settings) {
     .sort((a, b) => (a.makeBy !== b.makeBy ? (a.makeBy < b.makeBy ? -1 : 1) : (a.createdAt || "") < (b.createdAt || "") ? -1 : 1));
 }
 
+// Orders being made now. Cancelled ones stay on the list (marked) so nobody finishes them by mistake.
+function productionOrders(orders) {
+  const startedOn = (o) => (o.startedAt ? toISODate(new Date(o.startedAt)) : null);
+  return orders
+    .filter((o) => o.status === "production")
+    .map((o) => ({ ...o, startedOn: startedOn(o) }))
+    .sort((a, b) => ((a.dueDate || "9999") !== (b.dueDate || "9999") ? ((a.dueDate || "9999") < (b.dueDate || "9999") ? -1 : 1) : (a.createdAt || "") < (b.createdAt || "") ? -1 : 1));
+}
+
 // The sheet is plain HTML so the screen preview and the printed page are identical.
-// Nothing depends on color alone: late orders also say LATE in text.
-function buildPrintHtml(list, { user, productNameFor }) {
+// Nothing depends on color alone: late orders also say LATE in text, held orders say ON HOLD.
+function buildPrintHtml(list, { user, productNameFor, mode }) {
+  const prod = mode === "production";
   const today = todayISO();
-  const late = list.filter((o) => o.makeBy < today).length;
+  const dueOf = (o) => (prod ? o.dueDate : o.makeBy);
+  const late = list.filter((o) => dueOf(o) && dueOf(o) < today && !o.cancelledAt).length;
+  const held = list.filter((o) => o.heldAt && !o.cancelledAt).length;
   const printedAt = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   const rows = list.map((o) => {
-    const isLate = o.makeBy < today;
-    const isToday = o.makeBy === today;
+    const due = dueOf(o);
+    const isLate = !!due && due < today && !o.cancelledAt;
+    const isToday = due === today;
     const flag = isLate ? '<span class="flag">LATE</span>' : isToday ? '<span class="flag today">TODAY</span>' : "";
     const engr = o.engraving.on
       ? `<span class="yes">YES</span><div class="et">&ldquo;${esc(o.engraving.text)}&rdquo;</div>`
       : '<span class="no">No</span>';
-    return `<tr class="${isLate ? "late" : ""}">
+    const status = o.cancelledAt
+      ? '<div class="hold">CANCELLED</div><div class="reason">Do not make &mdash; cancelled in Shopify</div>'
+      : o.heldAt
+        ? `<div class="hold">ON HOLD</div><div class="reason">${esc(o.holdReason)}</div>`
+        : '<div class="line"></div><div class="line"></div>';
+    return `<tr class="${isLate ? "late" : ""} ${o.heldAt || o.cancelledAt ? "held" : ""}">
       <td class="chk"><div class="box"></div></td>
       <td class="num">#${esc(o.orderNumber)}</td>
       <td><span class="src">${esc(sourceLabel(o).toUpperCase())}</span></td>
-      <td>${fmtShort(o.orderDate)}</td>
-      <td class="mb">${fmtShort(o.makeBy)}${flag}</td>
+      ${prod ? `<td>${fmtShort(o.startedOn || o.orderDate)}</td>` : `<td>${fmtShort(o.orderDate)}</td>`}
+      <td class="mb">${fmtShort(due)}${flag}</td>
       <td><b>${esc(productNameFor(o))}</b></td>
-      <td>${esc(o.color) || "—"}</td>
+      <td>${esc(o.color) || "&mdash;"}</td>
       <td class="c">${esc(o.quantity)}</td>
       <td class="c">${engr}</td>
       <td>${esc(o.notes)}</td>
-      <td>${esc(o.customer)}</td>
+      ${prod ? `<td class="st">${status}</td>` : `<td>${esc(o.customer)}</td>`}
     </tr>`;
   }).join("");
+  const heads = prod
+    ? "<th></th><th>Order</th><th>From</th><th>Started</th><th>Due</th><th>Product</th><th>Color / variant</th><th>Qty</th><th>Laser engraving</th><th>Special notes</th><th>Status / reason</th>"
+    : "<th></th><th>Order</th><th>From</th><th>Ordered</th><th>Make by</th><th>Product</th><th>Color / variant</th><th>Qty</th><th>Laser engraving</th><th>Special notes</th><th>Customer</th>";
+  const pills = prod
+    ? `<div class="pill"><b>${list.length}</b> orders in production</div><div class="pill dark"><b>${held}</b> on hold</div>${late ? `<div class="pill red"><b>${late}</b> past their due date</div>` : ""}`
+    : `<div class="pill"><b>${list.length}</b> orders to start</div>${late ? `<div class="pill red"><b>${late}</b> past their make-by date</div>` : ""}<div class="pill">Make by = order date + ${MAKE_BY_DAYS} working days</div>`;
+  const empty = prod ? "No orders in production. Nothing to print." : "No new orders waiting. Nothing to print.";
+  const foot = prod
+    ? "Sorted by due date, most urgent first. Tick the box when finished. Write any status or reason on the lines in the last column."
+    : "Sorted by make-by date, most urgent first. Tick the box when production starts.";
   return `<!doctype html><html><head><meta charset="utf-8"><title>Production list ${today}</title><style>
 @page { size: A4 landscape; margin: 10mm 10mm 14mm; }
 * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
@@ -1779,11 +1887,11 @@ body { font-family: Arial, Helvetica, sans-serif; color: #1F1710; font-size: 10.
 h1 { margin: 0; font-size: 22px; letter-spacing: 1px; } .sub { font-size: 11px; color: #4A3F31; margin-top: 2px; }
 .meta { text-align: right; font-size: 11px; line-height: 1.5; } .meta b { font-size: 13px; }
 .sum { display: flex; gap: 10px; margin: 9px 0; } .pill { border: 1px solid #8A7B65; border-radius: 6px; padding: 5px 10px; font-size: 11px; } .pill b { font-size: 14px; }
-.pill.red { border: 2px solid #B23A22; color: #B23A22; background: #FDF1EE; }
+.pill.red { border: 2px solid #B23A22; color: #B23A22; background: #FDF1EE; } .pill.dark { border: 2px solid #1F1710; }
 table { width: 100%; border-collapse: collapse; } thead { display: table-header-group; } tr { page-break-inside: avoid; }
 th { background: #1F1710; color: #fff; text-align: left; font-size: 9.5px; letter-spacing: .5px; text-transform: uppercase; padding: 6px; }
 td { padding: 7px 6px; border-bottom: 1px solid #B9AC96; vertical-align: top; }
-tr.late td { background: #F3E3DE; } tr.late td.mb { color: #B23A22; }
+tr.late td { background: #F3E3DE; } tr.late td.mb { color: #B23A22; } tr.held td { background: #EDEDED; } tr.late.held td { background: #EDE0DC; }
 .box { width: 15px; height: 15px; border: 1.8px solid #1F1710; border-radius: 3px; } .chk { width: 26px; }
 .num { font-weight: 700; font-size: 12px; white-space: nowrap; } .c { text-align: center; } .mb { white-space: nowrap; font-weight: 700; }
 .flag { display: inline-block; margin-left: 5px; border: 1.5px solid #B23A22; color: #B23A22; background: #fff; font-size: 8px; font-weight: 700; padding: 1px 4px; border-radius: 3px; vertical-align: 1px; }
@@ -1791,27 +1899,29 @@ tr.late td { background: #F3E3DE; } tr.late td.mb { color: #B23A22; }
 .yes { background: #1F1710; color: #fff; font-weight: 700; padding: 2px 7px; border-radius: 3px; font-size: 10px; } .no { color: #6B5D49; }
 .et { font-weight: 700; margin-top: 3px; font-size: 11px; }
 .src { font-size: 8.5px; font-weight: 700; padding: 2px 6px; border-radius: 3px; border: 1px solid #1F1710; }
+.st { width: 190px; } .line { border-bottom: 1px solid #8A7B65; height: 15px; }
+.hold { display: inline-block; background: #1F1710; color: #fff; font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 3px; } .reason { margin-top: 4px; font-weight: 700; font-size: 11px; }
 .foot { margin-top: 10px; font-size: 9px; color: #4A3F31; } .empty { padding: 40px; text-align: center; font-size: 14px; color: #6B5D49; }
 </style></head><body>
-<div class="top"><div><h1>BANJARA GEAR</h1><div class="sub">Production list &mdash; New orders (not started yet)</div></div>
+<div class="top"><div><h1>BANJARA GEAR</h1><div class="sub">Production list &mdash; ${prod ? "Orders in production" : "New orders (not started yet)"}</div></div>
 <div class="meta"><b>Printed: ${esc(fmtShort(today))} ${today.slice(0, 4)}, ${printedAt}</b><br>Printed by: ${esc(user.name)}</div></div>
-<div class="sum"><div class="pill"><b>${list.length}</b> orders to start</div>${late ? `<div class="pill red"><b>${late}</b> past their make-by date</div>` : ""}
-<div class="pill">Make by = order date + ${MAKE_BY_DAYS} working days</div></div>
-${list.length ? `<table><thead><tr><th></th><th>Order</th><th>From</th><th>Ordered</th><th>Make by</th><th>Product</th><th>Color / variant</th><th>Qty</th><th>Laser engraving</th><th>Special notes</th><th>Customer</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No new orders waiting. Nothing to print.</div>'}
-<div class="foot">Sorted by make-by date, most urgent first. Tick the box when production starts.</div>
+<div class="sum">${pills}</div>
+${list.length ? `<table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table>` : `<div class="empty">${empty}</div>`}
+<div class="foot">${foot}</div>
 </body></html>`;
 }
 
 function PrintListPage({ orders, settings, user, productNameFor, loading, error, onRetry }) {
   const frame = useRef(null);
-  const list = useMemo(() => printableOrders(orders, settings), [orders, settings]);
-  const html = useMemo(() => buildPrintHtml(list, { user, productNameFor }), [list, user]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [mode, setMode] = useState("new");
+  const list = useMemo(() => (mode === "production" ? productionOrders(orders) : printableOrders(orders, settings)), [orders, settings, mode]);
+  const html = useMemo(() => buildPrintHtml(list, { user, productNameFor, mode }), [list, user, mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const print = () => {
     const w = frame.current && frame.current.contentWindow;
     if (!w) return;
     const old = document.title;
-    document.title = `Production-list-${todayISO()}`; // becomes the PDF file name
+    document.title = `Production-list-${mode === "production" ? "in-production" : "new-orders"}-${todayISO()}`; // becomes the PDF file name
     const restore = () => { document.title = old; window.removeEventListener("afterprint", restore); };
     window.addEventListener("afterprint", restore);
     w.focus();
@@ -1829,7 +1939,16 @@ function PrintListPage({ orders, settings, user, productNameFor, loading, error,
           Print / Save as PDF
         </button>
       </div>
-      <p className="mt-2 text-xs" style={{ color: "#A8977F" }}>All new orders that haven't started production, most urgent first. In the print window, choose "Save as PDF" to download it.</p>
+      <div className="mt-3 inline-flex rounded-xl p-1" style={{ backgroundColor: TOKENS.hide }}>
+        {[["new", "New orders"], ["production", "In production"]].map(([k, label]) => (
+          <button key={k} onClick={() => setMode(k)} className="rounded-lg px-4 py-1.5 text-sm font-semibold" style={{ backgroundColor: mode === k ? "white" : "transparent", color: mode === k ? TOKENS.ink : "#8A7B65" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <p className="mt-2 text-xs" style={{ color: "#A8977F" }}>
+        {mode === "production" ? "Orders being made now, most urgent first. Orders on hold show their reason." : "All new orders that haven't started production, most urgent first."} In the print window, choose "Save as PDF" to download it.
+      </p>
       {error && (
         <div className="mt-4 rounded-xl p-3 text-sm" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>
           {error} <button onClick={onRetry} className="font-bold underline ml-1">Try again</button>
@@ -2172,6 +2291,17 @@ export default function App() {
     }
   }, [refreshOrders]);
 
+  const changeHold = async (order, reason) => {
+    try {
+      const updated = await setOrderHold(order.id, reason);
+      setSelectedOrder(updated);
+      await refreshOrders(true);
+    } catch (e) {
+      if (e.code === "CONFLICT") { setSelectedOrder(null); await refreshOrders(true); }
+      throw e;
+    }
+  };
+
   // Same thing from a list row: errors show in the banner instead
   const advanceFromList = async (order, toStatus) => {
     setBusyId(order.id);
@@ -2277,6 +2407,7 @@ export default function App() {
           user={user}
           onClose={() => { setSelectedOrder(null); setInitialConfirm(null); }}
           onAdvance={advanceOrder}
+          onHold={changeHold}
           onSave={saveOrderChanges}
           onDelete={removeOrder}
           initialConfirm={initialConfirm}
