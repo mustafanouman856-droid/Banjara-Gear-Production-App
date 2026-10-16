@@ -1,9 +1,9 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import {
   Home, Clock, Factory, CheckCircle2, Truck, PackageCheck, Boxes, User, LogOut,
   Settings as SettingsIcon, Users, Plus, X, ChevronRight, ChevronLeft, Search,
   AlertTriangle, Zap, Image as ImageIcon, Edit2, Archive, ShoppingBag, Tag,
-  Calendar, MapPin, ClipboardList, Check, ArrowLeft, Eye, EyeOff, Loader2
+  Calendar, MapPin, ClipboardList, Check, ArrowLeft, Eye, EyeOff, Loader2, Printer
 } from "lucide-react";
 
 /* ----------------------------- Supabase connection ----------------------------- */
@@ -256,7 +256,7 @@ async function setProductArchived(id, archived) {
 }
 
 /* ----------------------------- Order data ----------------------------- */
-const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at,cancelled_at";
+const ORDER_COLUMNS = "id,order_number,source,customer,order_date,due_date,expected_delivery,status,product_id,product_name,quantity,color,leather_type,engraving_on,engraving_text,notes,created_at,cancelled_at,channel";
 const ACTIVE_STATUSES = "pending,production,completed,dispatched";
 const DELIVERED_PAGE = 30;
 
@@ -279,6 +279,7 @@ function mapOrder(row) {
     notes: row.notes || "",
     createdAt: row.created_at,
     cancelledAt: row.cancelled_at || null,
+    channel: row.channel || "",
   };
 }
 
@@ -297,6 +298,7 @@ function orderToRow(f) {
   if ("engravingOn" in f) row.engraving_on = !!f.engravingOn;
   if ("engravingText" in f) row.engraving_text = f.engravingOn === false ? "" : f.engravingText;
   if ("notes" in f) row.notes = f.notes;
+  if ("channel" in f) row.channel = f.channel || null;
   return row;
 }
 
@@ -646,6 +648,7 @@ const NAV_ITEMS = [
   { key: "completed", label: "Completed", icon: CheckCircle2, roles: ["owner", "production"] },
   { key: "dispatched", label: "Dispatched", icon: Truck, roles: ["owner", "production"] },
   { key: "delivered", label: "Delivered", icon: PackageCheck, roles: ["owner", "production"] },
+  { key: "print", label: "Print list", icon: Printer, roles: ["owner", "production"] },
   { key: "products", label: "Products", icon: Boxes, roles: ["owner", "production"] },
   { key: "members", label: "Members", icon: Users, roles: ["owner"] },
   { key: "settings", label: "Settings", icon: SettingsIcon, roles: ["owner"] },
@@ -1154,6 +1157,7 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
   const startEdit = () => {
     setDraft({
       customer: order.customer,
+      channel: order.channel,
       productName: order.productName,
       quantity: order.quantity,
       color: order.color,
@@ -1173,7 +1177,7 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
     setEditError("");
     try {
       const fields = {
-        customer: draft.customer, quantity: draft.quantity, color: draft.color, leatherType: draft.leatherType,
+        customer: draft.customer, channel: draft.channel, quantity: draft.quantity, color: draft.color, leatherType: draft.leatherType,
         engravingOn: draft.engravingOn, engravingText: draft.engravingText, notes: draft.notes,
         dueDate: draft.dueDate, expectedDelivery: draft.expectedDelivery,
       };
@@ -1265,7 +1269,7 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
                 <Row label="Due / production date" value={order.dueDate ? `${fmt(order.dueDate)} (${dayName(order.dueDate)})` : order.status === "pending" && settings ? `Set when production starts (est. ${fmt(addWorkingDaysISO(todayISO(), settings.productionDays, settings.workingDays))})` : "—"} />
                 <Row label="Expected delivery" value={order.expectedDelivery ? `${fmt(order.expectedDelivery)} (${dayName(order.expectedDelivery)})` : "—"} />
                 <Row label="Customer" value={order.customer || "—"} />
-                <Row label="Source" value={order.source} />
+                <Row label="Source" value={order.channel || order.source} />
               </Section>
 
               <Section
@@ -1300,6 +1304,14 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
           {editing && draft && (
             <Section title="Edit order">
               <Field label="Customer"><input value={draft.customer} onChange={(e) => setD("customer", e.target.value)} className="input" /></Field>
+              {order.source === "CUSTOM" && (
+                <Field label="Order came from">
+                  <select value={draft.channel || ""} onChange={(e) => setD("channel", e.target.value)} className="input">
+                    <option value="">Not set</option>
+                    {CHANNELS.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </Field>
+              )}
               {!order.productId && <Field label="Product name"><input value={draft.productName} onChange={(e) => setD("productName", e.target.value)} className="input" /></Field>}
               <Field label="Quantity"><input type="number" min={1} value={draft.quantity} onChange={(e) => setD("quantity", e.target.value)} className="input" /></Field>
               <Field label="Leather color">
@@ -1712,6 +1724,124 @@ function ProductForm({ product, onClose, onSaved }) {
   );
 }
 
+/* ----------------------------- Printable production list ----------------------------- */
+const MAKE_BY_DAYS = 2; // an order should be made within this many working days of being placed
+const CHANNELS = ["WhatsApp", "Instagram", "Walk-in", "Phone call", "Other"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const fmtShort = (iso) => {
+  if (!iso) return "—";
+  const d = parseDate(iso);
+  return `${DOW_NAMES[d.getDay()]} ${pad2(d.getDate())} ${MONTHS[d.getMonth()]}`;
+};
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const sourceLabel = (o) => o.channel || (o.source === "SHOPIFY" ? "Shopify" : "Custom");
+
+function printableOrders(orders, settings) {
+  return orders
+    .filter((o) => o.status === "pending" && !o.cancelledAt)
+    .map((o) => ({ ...o, makeBy: addWorkingDaysISO(o.orderDate, MAKE_BY_DAYS, settings.workingDays) }))
+    .sort((a, b) => (a.makeBy !== b.makeBy ? (a.makeBy < b.makeBy ? -1 : 1) : (a.createdAt || "") < (b.createdAt || "") ? -1 : 1));
+}
+
+// The sheet is plain HTML so the screen preview and the printed page are identical.
+// Nothing depends on color alone: late orders also say LATE in text.
+function buildPrintHtml(list, { user, productNameFor }) {
+  const today = todayISO();
+  const late = list.filter((o) => o.makeBy < today).length;
+  const printedAt = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const rows = list.map((o) => {
+    const isLate = o.makeBy < today;
+    const isToday = o.makeBy === today;
+    const flag = isLate ? '<span class="flag">LATE</span>' : isToday ? '<span class="flag today">TODAY</span>' : "";
+    const engr = o.engraving.on
+      ? `<span class="yes">YES</span><div class="et">&ldquo;${esc(o.engraving.text)}&rdquo;</div>`
+      : '<span class="no">No</span>';
+    return `<tr class="${isLate ? "late" : ""}">
+      <td class="chk"><div class="box"></div></td>
+      <td class="num">#${esc(o.orderNumber)}</td>
+      <td><span class="src">${esc(sourceLabel(o).toUpperCase())}</span></td>
+      <td>${fmtShort(o.orderDate)}</td>
+      <td class="mb">${fmtShort(o.makeBy)}${flag}</td>
+      <td><b>${esc(productNameFor(o))}</b></td>
+      <td>${esc(o.color) || "—"}</td>
+      <td class="c">${esc(o.quantity)}</td>
+      <td class="c">${engr}</td>
+      <td>${esc(o.notes)}</td>
+      <td>${esc(o.customer)}</td>
+    </tr>`;
+  }).join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Production list ${today}</title><style>
+@page { size: A4 landscape; margin: 10mm 10mm 14mm; }
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { font-family: Arial, Helvetica, sans-serif; color: #1F1710; font-size: 10.5px; margin: 0; background: #fff; }
+@media screen { body { min-width: 1020px; padding: 14px 18px; } }
+.top { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2.5px solid #1F1710; padding-bottom: 7px; }
+h1 { margin: 0; font-size: 22px; letter-spacing: 1px; } .sub { font-size: 11px; color: #4A3F31; margin-top: 2px; }
+.meta { text-align: right; font-size: 11px; line-height: 1.5; } .meta b { font-size: 13px; }
+.sum { display: flex; gap: 10px; margin: 9px 0; } .pill { border: 1px solid #8A7B65; border-radius: 6px; padding: 5px 10px; font-size: 11px; } .pill b { font-size: 14px; }
+.pill.red { border: 2px solid #B23A22; color: #B23A22; background: #FDF1EE; }
+table { width: 100%; border-collapse: collapse; } thead { display: table-header-group; } tr { page-break-inside: avoid; }
+th { background: #1F1710; color: #fff; text-align: left; font-size: 9.5px; letter-spacing: .5px; text-transform: uppercase; padding: 6px; }
+td { padding: 7px 6px; border-bottom: 1px solid #B9AC96; vertical-align: top; }
+tr.late td { background: #F3E3DE; } tr.late td.mb { color: #B23A22; }
+.box { width: 15px; height: 15px; border: 1.8px solid #1F1710; border-radius: 3px; } .chk { width: 26px; }
+.num { font-weight: 700; font-size: 12px; white-space: nowrap; } .c { text-align: center; } .mb { white-space: nowrap; font-weight: 700; }
+.flag { display: inline-block; margin-left: 5px; border: 1.5px solid #B23A22; color: #B23A22; background: #fff; font-size: 8px; font-weight: 700; padding: 1px 4px; border-radius: 3px; vertical-align: 1px; }
+.flag.today { border-color: #1F1710; color: #1F1710; }
+.yes { background: #1F1710; color: #fff; font-weight: 700; padding: 2px 7px; border-radius: 3px; font-size: 10px; } .no { color: #6B5D49; }
+.et { font-weight: 700; margin-top: 3px; font-size: 11px; }
+.src { font-size: 8.5px; font-weight: 700; padding: 2px 6px; border-radius: 3px; border: 1px solid #1F1710; }
+.foot { margin-top: 10px; font-size: 9px; color: #4A3F31; } .empty { padding: 40px; text-align: center; font-size: 14px; color: #6B5D49; }
+</style></head><body>
+<div class="top"><div><h1>BANJARA GEAR</h1><div class="sub">Production list &mdash; New orders (not started yet)</div></div>
+<div class="meta"><b>Printed: ${esc(fmtShort(today))} ${today.slice(0, 4)}, ${printedAt}</b><br>Printed by: ${esc(user.name)}</div></div>
+<div class="sum"><div class="pill"><b>${list.length}</b> orders to start</div>${late ? `<div class="pill red"><b>${late}</b> past their make-by date</div>` : ""}
+<div class="pill">Make by = order date + ${MAKE_BY_DAYS} working days</div></div>
+${list.length ? `<table><thead><tr><th></th><th>Order</th><th>From</th><th>Ordered</th><th>Make by</th><th>Product</th><th>Color / variant</th><th>Qty</th><th>Laser engraving</th><th>Special notes</th><th>Customer</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No new orders waiting. Nothing to print.</div>'}
+<div class="foot">Sorted by make-by date, most urgent first. Tick the box when production starts.</div>
+</body></html>`;
+}
+
+function PrintListPage({ orders, settings, user, productNameFor, loading, error, onRetry }) {
+  const frame = useRef(null);
+  const list = useMemo(() => printableOrders(orders, settings), [orders, settings]);
+  const html = useMemo(() => buildPrintHtml(list, { user, productNameFor }), [list, user]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const print = () => {
+    const w = frame.current && frame.current.contentWindow;
+    if (!w) return;
+    const old = document.title;
+    document.title = `Production-list-${todayISO()}`; // becomes the PDF file name
+    const restore = () => { document.title = old; window.removeEventListener("afterprint", restore); };
+    window.addEventListener("afterprint", restore);
+    w.focus();
+    w.print();
+  };
+
+  return (
+    <div className="p-4 md:p-8 max-w-6xl">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2.5">
+          <Printer size={20} style={{ color: TOKENS.saddle }} />
+          <h1 className="text-xl font-bold" style={{ color: TOKENS.ink }}>Print list</h1>
+        </div>
+        <button onClick={print} disabled={loading && orders.length === 0} className="rounded-xl px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50" style={{ backgroundColor: TOKENS.saddle }}>
+          Print / Save as PDF
+        </button>
+      </div>
+      <p className="mt-2 text-xs" style={{ color: "#A8977F" }}>All new orders that haven't started production, most urgent first. In the print window, choose "Save as PDF" to download it.</p>
+      {error && (
+        <div className="mt-4 rounded-xl p-3 text-sm" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>
+          {error} <button onClick={onRetry} className="font-bold underline ml-1">Try again</button>
+        </div>
+      )}
+      <div className="mt-4 rounded-2xl border overflow-hidden bg-white" style={{ borderColor: TOKENS.line }}>
+        <iframe ref={frame} title="Production list" srcDoc={html} className="w-full block" style={{ height: "68vh", border: 0 }} />
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------- Custom order form ----------------------------- */
 function CustomOrderForm({ products, settings, onClose, onCreate }) {
   const active = products.filter((p) => !p.archived);
@@ -1719,7 +1849,7 @@ function CustomOrderForm({ products, settings, onClose, onCreate }) {
   const [form, setForm] = useState({
     orderNumber: "", customer: "", productId: first ? first.id : "", productName: "", quantity: 1,
     color: first?.colors[0] || "", leatherType: first?.leatherType || "", engravingOn: false, engravingText: "", notes: "",
-    orderDate: todayISO(), dueDate: "",
+    orderDate: todayISO(), dueDate: "", channel: "WhatsApp",
   });
   const [files, setFiles] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -1743,6 +1873,7 @@ function CustomOrderForm({ products, settings, onClose, onCreate }) {
         customer: form.customer.trim() || "Walk-in",
         orderDate: form.orderDate || todayISO(),
         dueDate: form.dueDate,
+        channel: form.channel,
         productId: form.productId || null,
         productName: form.productId ? "" : form.productName.trim(),
         quantity: form.quantity,
@@ -1768,6 +1899,11 @@ function CustomOrderForm({ products, settings, onClose, onCreate }) {
         </div>
         <div className="p-4 space-y-4 pb-10">
           <Field label="Order number"><input value={form.orderNumber} onChange={(e) => set("orderNumber", e.target.value)} placeholder="e.g. 10530" className="input" /></Field>
+          <Field label="Order came from">
+            <select value={form.channel} onChange={(e) => set("channel", e.target.value)} className="input">
+              {CHANNELS.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
           <Field label="Customer name (optional)"><input value={form.customer} onChange={(e) => set("customer", e.target.value)} placeholder="Walk-in — name" className="input" /></Field>
           <Field label="Product">
             <select value={form.productId} onChange={(e) => pickProduct(e.target.value)} className="input">
@@ -2098,6 +2234,7 @@ export default function App() {
   if (page === "dashboard") content = <Dashboard orders={orders} stats={stats} setPage={setPage} settings={settings} user={user} />;
   else if (page === "delivered") content = <DeliveredPage productNameFor={productNameFor} total={stats ? stats.delivered : null} refreshKey={deliveredKey} onOpen={openOrder} />;
   else if (["pending", "production", "completed", "dispatched"].includes(page)) content = <OrderListPage status={page} orders={orders} loading={ordersLoading} error={ordersError} onRetry={() => refreshOrders()} {...listProps} />;
+  else if (page === "print") content = <PrintListPage orders={orders} settings={settings} user={user} productNameFor={productNameFor} loading={ordersLoading} error={ordersError} onRetry={() => refreshOrders()} />;
   else if (page === "products") content = <ProductsPage products={products} loading={productsLoading} error={productsError} user={user} onOpenProduct={setSelectedProduct} onAdd={() => setEditingProduct("new")} onRetry={refreshProducts} />;
   else if (page === "members" && isOwner) content = <MembersPage user={user} />;
   else if (page === "settings" && isOwner) content = <SettingsPage settings={settings} onSave={saveSettingsChanges} />;
