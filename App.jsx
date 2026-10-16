@@ -1282,7 +1282,14 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
                 <Row label="Leather type" value={leatherType} />
               </Section>
 
-              <Section title="Customization">
+              <Section
+                title="Customization"
+                action={isOwner && (
+                  <button onClick={startEdit} className="flex items-center gap-1 text-xs font-semibold" style={{ color: TOKENS.saddle }}>
+                    <Edit2 size={12} /> Edit
+                  </button>
+                )}
+              >
                 <Row label="Laser engraving" value={order.engraving.on ? "Yes" : "No"} highlight={order.engraving.on} />
                 {order.engraving.on && <Row label="Engraving text" value={order.engraving.text || "—"} />}
                 <Row label="Special instructions" value={order.notes || "None"} />
