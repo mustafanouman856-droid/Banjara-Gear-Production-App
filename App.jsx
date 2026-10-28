@@ -383,6 +383,22 @@ const fetchProductFinance = () => financeGet("product_finance?select=product_id,
 const saveProductFinance = (productId, patch) => financeUpsert("product_finance", "product_id", { product_id: productId, ...patch }, "Couldn't save that price.");
 const saveOrderAmount = (orderId, amount) => financeUpsert("order_finance", "order_id", { order_id: orderId, amount }, "Couldn't save that amount.");
 const saveAdTotal = (from, to, amount) => financeUpsert("ad_totals", "from_date,to_date", { from_date: from, to_date: to, amount }, "Couldn't save ad spend.");
+const fetchVariantFinance = () => financeGet("variant_finance?select=id,product_id,match_text,sell_price,cost&order=match_text", "Couldn't load variant prices.");
+async function addVariantFinance(productId, matchText) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/variant_finance?select=id,product_id,match_text,sell_price,cost`, {
+    method: "POST", headers: { "Content-Type": "application/json", Prefer: "return=representation" }, body: JSON.stringify({ product_id: productId, match_text: matchText }),
+  });
+  if (!res.ok) throw new Error(res.status === 409 ? "That variant is already in the list." : await readError(res, "Couldn't add the variant."));
+  return (await res.json())[0];
+}
+async function saveVariantFinance(id, patch) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/variant_finance?id=eq.${id}`, { method: "PATCH", headers: { "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify(patch) });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't save that price."));
+}
+async function deleteVariantFinance(id) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/variant_finance?id=eq.${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't remove the variant."));
+}
 const saveOrderPayment = (orderId, payment) => financeUpsert("order_finance", "order_id", { order_id: orderId, payment }, "Couldn't save how it was paid.");
 const fetchOrderFinance = async (orderId) => { const r = await financeGet(`order_finance?order_id=eq.${orderId}&select=amount,returned_at`, "Couldn't load order money."); return r[0] || null; };
 async function saveLeopardsPct(pct) {
@@ -2194,7 +2210,7 @@ function buildFinanceReportHtml(d, { user }) {
   const line = (label, f, bold) => `<tr class="${bold ? "tot" : ""}"><td>${label}</td>${cols.map(([, g]) => `<td class="n">${f(g)}</td>`).join("")}</tr>`;
   const returned = d.orders.filter((o) => o.returned);
   const counted = d.orders.filter((o) => !o.returned);
-  const orderRow = (o) => `<tr class="${o.returned ? "ret" : ""}"><td class="b">#${esc(o.order_number)}</td><td>${esc(o.grp === "custom" ? (o.channel || "Custom") : "Shopify")}</td><td>${esc(o.product)} &times; ${esc(o.quantity)}</td><td>${fmtShort(o.on_date)}</td><td>${o.payment === "online" ? "Paid online" : "COD"}</td><td class="n">${o.amount == null ? "&mdash;" : esc(rs(o.amount))}</td><td class="n">${o.cost == null ? "&mdash;" : esc(rs(o.cost))}</td><td>${o.returned ? "<b>RETURNED</b>" : ""}</td></tr>`;
+  const orderRow = (o) => `<tr class="${o.returned ? "ret" : ""}"><td class="b">#${esc(o.order_number)}</td><td>${esc(o.grp === "custom" ? (o.channel || "Custom") : "Shopify")}</td><td>${esc(o.product)}${o.variant ? ` &ndash; ${esc(o.variant)}` : ""} &times; ${esc(o.quantity)}</td><td>${fmtShort(o.on_date)}</td><td>${o.payment === "online" ? "Paid online" : "COD"}</td><td class="n">${o.amount == null ? "&mdash;" : esc(rs(o.amount))}</td><td class="n">${o.cost == null ? "&mdash;" : esc(rs(o.cost))}</td><td>${o.returned ? "<b>RETURNED</b>" : ""}</td></tr>`;
   return `<!doctype html><html><head><meta charset="utf-8"><title>Finance report</title><style>
 @page { size: A4 portrait; margin: 12mm; }
 * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
@@ -2268,6 +2284,9 @@ function FinancePage({ products, user }) {
   const [customTo, setCustomTo] = useState(() => todayISO());
   const [data, setData] = useState(null);
   const [prodFin, setProdFin] = useState({});
+  const [variants, setVariants] = useState([]);
+  const [addingFor, setAddingFor] = useState(null);
+  const [newVariant, setNewVariant] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [reportOpen, setReportOpen] = useState(false);
@@ -2288,6 +2307,7 @@ function FinancePage({ products, user }) {
   useEffect(() => { setLoading(true); load(); }, [load]);
   useEffect(() => {
     fetchProductFinance().then((rows) => setProdFin(Object.fromEntries(rows.map((r) => [r.product_id, { sell: r.sell_price, cost: r.cost }])))).catch((e) => setError(e.message));
+    fetchVariantFinance().then(setVariants).catch((e) => setError(e.message));
   }, []);
 
   const run = async (fn) => { try { await fn(); await load(); } catch (e) { setError(e.message); } };
@@ -2307,6 +2327,33 @@ function FinancePage({ products, user }) {
     const next = { ...cur, [key]: v };
     setProdFin((m) => ({ ...m, [id]: next }));
     await run(() => saveProductFinance(id, { sell_price: next.sell ?? null, cost: next.cost ?? null }));
+  };
+
+  const setVariantValue = async (v, key, val) => {
+    setVariants((all) => all.map((x) => (x.id === v.id ? { ...x, [key]: val } : x)));
+    await run(() => saveVariantFinance(v.id, { [key]: val }));
+  };
+  const submitVariant = async (productId) => {
+    const text = newVariant.trim();
+    if (!text) return;
+    try {
+      const row = await addVariantFinance(productId, text);
+      setVariants((all) => [...all, row]);
+      setNewVariant("");
+      setAddingFor(null);
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+  const removeVariant = async (v) => {
+    try {
+      await deleteVariantFinance(v.id);
+      setVariants((all) => all.filter((x) => x.id !== v.id));
+      await load();
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
   const seg = ({ value, onChange, items }) => (
@@ -2420,7 +2467,7 @@ function FinancePage({ products, user }) {
                     <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>#{o.order_number} <span className="text-[11px] font-semibold" style={{ color: "#8A7B65" }}>{o.grp === "custom" ? (o.channel || "Custom") : "Shopify"}</span> {o.returned && <span className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-bold text-white" style={{ backgroundColor: TOKENS.ink }}>RETURNED</span>}</p>
                     <p className="text-[11px] shrink-0" style={{ color: "#8A7B65" }}>{by} {fmtShort(o.on_date)}</p>
                   </div>
-                  <p className="text-xs truncate" style={{ color: "#8A7B65" }}>{o.product} × {o.quantity}{o.cost != null ? ` · cost ${rs(o.cost)}` : " · no cost set"}</p>
+                  <p className="text-xs truncate" style={{ color: "#8A7B65" }}>{o.product}{o.variant ? ` – ${o.variant}` : ""} × {o.quantity}{o.cost != null ? ` · cost ${rs(o.cost)}` : " · no cost set"}</p>
                   <div className="mt-1.5 flex items-center gap-2">
                     <div className="w-28"><MoneyInput label={`Amount for order ${o.order_number}`} value={o.amount} placeholder="Price" onCommit={(n) => run(() => saveOrderAmount(o.id, n))} /></div>
                     <button onClick={() => run(() => saveOrderPayment(o.id, o.payment === "cod" ? "online" : "cod"))} aria-label={`Payment for order ${o.order_number}`} className="rounded-lg border px-2.5 py-1.5 text-[11px] font-bold whitespace-nowrap" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>{o.payment === "cod" ? "COD" : "Paid online"}</button>
@@ -2437,15 +2484,39 @@ function FinancePage({ products, user }) {
       <details className="mt-4 rounded-xl border bg-white" style={{ borderColor: TOKENS.line }}>
         <summary className="cursor-pointer p-3 text-sm font-bold" style={{ color: TOKENS.ink }}>Product prices and costs</summary>
         <div className="px-3 pb-3">
-          <p className="text-xs mb-2" style={{ color: "#A8977F" }}>Cost of making is used for every order. Selling price is used only when an order has no price of its own (old orders and custom orders).</p>
+          <p className="text-xs mb-2" style={{ color: "#A8977F" }}>Cost of making is used for every order. Selling price is used only when an order has no price of its own (old orders and custom orders). Use + Variant when one product has sizes, weights or editions with different prices.</p>
           <div className="grid grid-cols-[1fr_6rem_6rem] gap-2 text-[11px] font-semibold uppercase" style={{ color: "#8A7B65" }}>
             <span>Product</span><span className="text-right">Sell price</span><span className="text-right">Cost</span>
           </div>
           {products.map((p) => (
-            <div key={p.id} className="grid grid-cols-[1fr_6rem_6rem] gap-2 items-center mt-1.5">
-              <span className="text-sm truncate" style={{ color: TOKENS.ink }}>{p.name}</span>
-              <MoneyInput label={`${p.name} selling price`} value={prodFin[p.id]?.sell ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "sell", n)} />
-              <MoneyInput label={`${p.name} cost`} value={prodFin[p.id]?.cost ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "cost", n)} />
+            <div key={p.id} className="mt-1.5">
+              <div className="grid grid-cols-[1fr_6rem_6rem] gap-2 items-center">
+                <span className="text-sm truncate" style={{ color: TOKENS.ink }}>{p.name}</span>
+                <MoneyInput label={`${p.name} selling price`} value={prodFin[p.id]?.sell ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "sell", n)} />
+                <MoneyInput label={`${p.name} cost`} value={prodFin[p.id]?.cost ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "cost", n)} />
+              </div>
+              {variants.filter((v) => v.product_id === p.id).map((v) => (
+                <div key={v.id} className="grid grid-cols-[1fr_6rem_6rem] gap-2 items-center mt-1 pl-3">
+                  <div className="flex items-center gap-1 min-w-0">
+                    <span className="text-xs font-semibold truncate" style={{ color: "#5A4E3F" }}>↳ {v.match_text}</span>
+                    <button aria-label={`Remove variant ${v.match_text}`} onClick={() => removeVariant(v)} className="p-0.5 shrink-0" style={{ color: "#A8977F" }}><X size={13} /></button>
+                  </div>
+                  <MoneyInput label={`${p.name} ${v.match_text} selling price`} value={v.sell_price} placeholder="—" onCommit={(n) => setVariantValue(v, "sell_price", n)} />
+                  <MoneyInput label={`${p.name} ${v.match_text} cost`} value={v.cost} placeholder="—" onCommit={(n) => setVariantValue(v, "cost", n)} />
+                </div>
+              ))}
+              {addingFor === p.id ? (
+                <div className="mt-1.5 pl-3">
+                  <div className="flex gap-2">
+                    <input aria-label={`New variant for ${p.name}`} value={newVariant} onChange={(e) => setNewVariant(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submitVariant(p.id); }} placeholder="e.g. Executive, or 75" className="input" style={{ padding: "0.4rem 0.6rem" }} />
+                    <button onClick={() => submitVariant(p.id)} className="rounded-lg px-3 text-xs font-bold text-white" style={{ backgroundColor: TOKENS.saddle }}>Add</button>
+                    <button onClick={() => { setAddingFor(null); setNewVariant(""); }} className="rounded-lg border px-2 text-xs font-semibold" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>Cancel</button>
+                  </div>
+                  <p className="mt-1 text-[11px]" style={{ color: "#A8977F" }}>Type a word from the variant's name in Shopify. Any order whose variant contains it gets this price and cost instead.</p>
+                </div>
+              ) : (
+                <button onClick={() => { setAddingFor(p.id); setNewVariant(""); }} aria-label={`Add variant to ${p.name}`} className="mt-0.5 pl-3 text-[11px] font-semibold underline" style={{ color: "#8A7B65" }}>+ Variant (size, weight, edition)</button>
+              )}
             </div>
           ))}
           <div className="mt-4 flex items-center justify-between gap-3 border-t pt-3" style={{ borderColor: TOKENS.line }}>
