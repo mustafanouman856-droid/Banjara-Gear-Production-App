@@ -75,6 +75,27 @@ export function buildRows(order) {
   });
 }
 
+// What the customer paid for each line: price x quantity minus discounts, with shipping added to the first line.
+// Shopify sends money as text like "1500.00".
+export function lineAmounts(order) {
+  const items = order.line_items || [];
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+  const shipping = num(order.total_shipping_price_set?.shop_money?.amount ?? (order.shipping_lines || []).reduce((t, l) => t + num(l.price), 0));
+  return items.map((it, i) => {
+    const disc = (it.discount_allocations || []).reduce((t, d) => t + num(d.amount), 0);
+    const amount = Math.max(0, num(it.price) * (it.quantity || 1) - disc) + (i === 0 ? shipping : 0);
+    return Math.round(amount * 100) / 100;
+  });
+}
+
+// Cash on delivery or paid online? Shopify lists the payment method(s) used. Unknown stays empty (counted as COD).
+export function paymentType(order) {
+  const names = [...(order.payment_gateway_names || []), order.gateway || ""].map((x) => String(x));
+  if (names.some((n) => /cash on delivery|\bcod\b/i.test(n))) return "cod";
+  if (names.some((n) => n.trim() !== "" && !/^manual$/i.test(n.trim())) || order.financial_status === "paid") return "online";
+  return null;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("POST only");
 
@@ -109,6 +130,9 @@ export default async function handler(req, res) {
 
     const rows = buildRows(order);
     if (!rows.length) return res.status(200).send("No items");
+    const amounts = lineAmounts(order);
+    const amountByNumber = Object.fromEntries(rows.map((r, i) => [r.order_number, amounts[i]]));
+    const payment = paymentType(order);
 
     // Link each item to a Product Library entry when the names match
     for (const row of rows) {
@@ -121,15 +145,31 @@ export default async function handler(req, res) {
     }
 
     // Shopify may send the same order twice; duplicates are ignored
-    const ins = await fetch(`${SUPABASE_URL}/rest/v1/orders?on_conflict=order_number`, {
+    const ins = await fetch(`${SUPABASE_URL}/rest/v1/orders?on_conflict=order_number&select=id,order_number`, {
       method: "POST",
-      headers: dbHeaders(key, { Prefer: "resolution=ignore-duplicates,return=minimal" }),
+      headers: dbHeaders(key, { Prefer: "resolution=ignore-duplicates,return=representation" }),
       body: JSON.stringify(rows),
     });
     if (!ins.ok) {
       console.error("Insert failed", ins.status, await ins.text());
       return res.status(500).send("Could not save order"); // Shopify will retry
     }
+
+    // Save what each line was sold for (owner-only table). A failure here must not undo the order itself.
+    try {
+      const created = await ins.json();
+      const fin = created
+        .filter((o) => amountByNumber[o.order_number] !== undefined)
+        .map((o) => ({ order_id: o.id, amount: amountByNumber[o.order_number], payment }));
+      if (fin.length) {
+        const f = await fetch(`${SUPABASE_URL}/rest/v1/order_finance?on_conflict=order_id`, {
+          method: "POST",
+          headers: dbHeaders(key, { Prefer: "resolution=ignore-duplicates,return=minimal" }),
+          body: JSON.stringify(fin),
+        });
+        if (!f.ok) console.error("Amount save failed", f.status, await f.text());
+      }
+    } catch (e) { console.error("Amount save error", e); }
     return res.status(200).send("OK");
   } catch (e) {
     console.error(e);
