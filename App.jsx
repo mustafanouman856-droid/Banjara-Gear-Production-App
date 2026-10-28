@@ -3,7 +3,7 @@ import {
   Home, Clock, Factory, CheckCircle2, Truck, PackageCheck, Boxes, User, LogOut,
   Settings as SettingsIcon, Users, Plus, X, ChevronRight, ChevronLeft, Search,
   AlertTriangle, Zap, Image as ImageIcon, Edit2, Archive, ShoppingBag, Tag,
-  Calendar, MapPin, ClipboardList, Check, ArrowLeft, Eye, EyeOff, Loader2, Printer
+  Calendar, MapPin, ClipboardList, Check, ArrowLeft, Eye, EyeOff, Loader2, Printer, Calculator
 } from "lucide-react";
 
 /* ----------------------------- Supabase connection ----------------------------- */
@@ -355,6 +355,43 @@ async function saveSettings(s) {
 }
 
 // History and extra photos are only fetched when an order is opened
+/* ----------------------------- Money (owner only) ----------------------------- */
+// All of this lives in owner-only database tables; production's logins are refused by the database itself.
+async function financeRpc(name, args) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/rpc/${name}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(args),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't load the money numbers."));
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+const fetchRangeFinance = (from, to, by) => financeRpc("range_finance", { p_from: from, p_to: to, p_by: by });
+const setOrderReturned = (orderId, returned) => financeRpc("set_order_returned", { p_order: orderId, p_returned: returned });
+
+async function financeGet(path, fallback) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/${path}`);
+  if (!res.ok) throw new Error(await readError(res, fallback));
+  return res.json();
+}
+async function financeUpsert(table, conflict, body, fallback) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/${table}?on_conflict=${conflict}`, {
+    method: "POST", headers: { "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await readError(res, fallback));
+}
+const fetchProductFinance = () => financeGet("product_finance?select=product_id,sell_price,cost", "Couldn't load product prices.");
+const saveProductFinance = (productId, patch) => financeUpsert("product_finance", "product_id", { product_id: productId, ...patch }, "Couldn't save that price.");
+const saveOrderAmount = (orderId, amount) => financeUpsert("order_finance", "order_id", { order_id: orderId, amount }, "Couldn't save that amount.");
+const saveAdTotal = (from, to, amount) => financeUpsert("ad_totals", "from_date,to_date", { from_date: from, to_date: to, amount }, "Couldn't save ad spend.");
+const saveOrderPayment = (orderId, payment) => financeUpsert("order_finance", "order_id", { order_id: orderId, payment }, "Couldn't save how it was paid.");
+const fetchOrderFinance = async (orderId) => { const r = await financeGet(`order_finance?order_id=eq.${orderId}&select=amount,returned_at`, "Couldn't load order money."); return r[0] || null; };
+async function saveLeopardsPct(pct) {
+  const res = await authedFetch(`${SUPABASE_URL}/rest/v1/finance_settings?id=eq.1`, {
+    method: "PATCH", headers: { "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify({ leopards_pct: pct }),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Couldn't save the percentage."));
+}
+
 async function loadOrderExtras(orderId) {
   const [h, p] = await Promise.all([
     authedFetch(`${SUPABASE_URL}/rest/v1/order_history?order_id=eq.${orderId}&select=event,by_name,created_at&order=created_at.asc`),
@@ -670,6 +707,7 @@ const NAV_ITEMS = [
   { key: "delivered", label: "Delivered", icon: PackageCheck, roles: ["owner", "production"] },
   { key: "print", label: "Print list", icon: Printer, roles: ["owner", "production"] },
   { key: "products", label: "Products", icon: Boxes, roles: ["owner", "production"] },
+  { key: "finance", label: "Finance", icon: Calculator, roles: ["owner"] },
   { key: "members", label: "Members", icon: Users, roles: ["owner"] },
   { key: "settings", label: "Settings", icon: SettingsIcon, roles: ["owner"] },
   { key: "account", label: "Account", icon: User, roles: ["owner", "production"] },
@@ -1159,6 +1197,9 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
   const [holdOpen, setHoldOpen] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holdBusy, setHoldBusy] = useState(false);
+  const [fin, setFin] = useState(null);
+  const [finBusy, setFinBusy] = useState(false);
+  const canSeeMoney = isOwner && (order.status === "dispatched" || order.status === "delivered") && !order.cancelledAt;
 
   const isOverdue = order.status === "production" && !!order.dueDate && order.dueDate < todayISO();
   const leatherType = order.leatherType || product?.leatherType || "—";
@@ -1173,6 +1214,26 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
       .finally(() => { if (!cancelled) setExtrasLoading(false); });
     return () => { cancelled = true; };
   }, [order.id, order.status, order.createdAt, order.notes, order.quantity, order.color, order.dueDate, order.expectedDelivery]);
+
+  useEffect(() => {
+    if (!canSeeMoney) { setFin(null); return undefined; }
+    let gone = false;
+    fetchOrderFinance(order.id).then((r) => { if (!gone) setFin(r || {}); }).catch(() => { if (!gone) setFin(null); });
+    return () => { gone = true; };
+  }, [order.id, canSeeMoney]);
+  const toggleReturned = async () => {
+    setFinBusy(true);
+    setError("");
+    try {
+      await setOrderReturned(order.id, !fin?.returned_at);
+      setFin(await fetchOrderFinance(order.id) || {});
+      loadOrderExtras(order.id).then(setExtras).catch(() => {});
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setFinBusy(false);
+    }
+  };
 
   const act = async () => {
     setBusy(true);
@@ -1325,6 +1386,20 @@ function OrderDetail({ order, product, productName, settings, user, onClose, onA
                   <p className="text-sm" style={{ color: "#5A4E3F" }}>In progress.</p>
                   <button onClick={() => setHoldOpen(true)} className="rounded-lg border px-3 py-1.5 text-xs font-bold" style={{ borderColor: TOKENS.ink, color: TOKENS.ink }}>Put on hold</button>
                 </div>
+              )}
+            </Section>
+          )}
+          {canSeeMoney && fin && (
+            <Section title="Money (owner only)">
+              <Row label="Sold for" value={fin.amount != null ? rs(fin.amount) : "Not set (uses product price)"} />
+              {fin.returned_at ? (
+                <div>
+                  <span className="inline-block rounded px-2 py-0.5 text-xs font-bold text-white" style={{ backgroundColor: TOKENS.ink }}>RETURNED</span>
+                  <p className="mt-1 text-[11px]" style={{ color: "#A8977F" }}>Not counted in revenue, Leopards deduction or cost.</p>
+                  <button onClick={toggleReturned} disabled={finBusy} className="mt-2 w-full rounded-lg border py-2 text-sm font-semibold disabled:opacity-50" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>{finBusy ? "Saving…" : "Undo return"}</button>
+                </div>
+              ) : (
+                <button onClick={toggleReturned} disabled={finBusy} className="w-full rounded-lg border py-2 text-sm font-bold disabled:opacity-50" style={{ borderColor: TOKENS.ink, color: TOKENS.ink }}>{finBusy ? "Saving…" : "Mark as returned"}</button>
               )}
             </Section>
           )}
@@ -2082,6 +2157,309 @@ function Field({ label, children }) {
 }
 
 /* ----------------------------- Members / Settings / Account ----------------------------- */
+/* ----------------------------- Finance (owner only) ----------------------------- */
+const rs = (n) => `${Number(n) < 0 ? "−" : ""}Rs ${Math.abs(Math.round(Number(n) || 0)).toLocaleString("en-US")}`;
+const weekStartOf = (iso) => { const d = parseDate(iso); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return toISODate(d); }; // Monday
+const shiftDays = (iso, n) => { const d = parseDate(iso); d.setDate(d.getDate() + n); return toISODate(d); };
+const monthStartOf = (iso) => `${iso.slice(0, 8)}01`;
+const addMonths = (iso, n) => { const d = parseDate(iso); d.setMonth(d.getMonth() + n, 1); return toISODate(d); };
+const monthEndOf = (iso) => shiftDays(addMonths(monthStartOf(iso), 1), -1);
+
+// A number box that saves when you tap away from it
+function MoneyInput({ value, onCommit, placeholder, label }) {
+  const [text, setText] = useState(value == null ? "" : String(value));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setText(value == null ? "" : String(value)); }, [value]);
+  const commit = async () => {
+    const clean = text.trim();
+    if (clean === (value == null ? "" : String(value))) return;
+    const n = clean === "" ? null : Number(clean);
+    if (n !== null && (!Number.isFinite(n) || n < 0)) { setText(value == null ? "" : String(value)); return; }
+    setBusy(true);
+    try { await onCommit(n); } finally { setBusy(false); }
+  };
+  return (
+    <input type="number" inputMode="decimal" min="0" aria-label={label} value={text} placeholder={placeholder} disabled={busy}
+      onChange={(e) => setText(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+      className="input" style={{ padding: "0.4rem 0.6rem", textAlign: "right" }} />
+  );
+}
+
+// The printable report. Plain HTML like the print list; nothing depends on color.
+function buildFinanceReportHtml(d, { user }) {
+  const by = d.by === "delivered" ? "delivered" : "dispatched";
+  const range = `${fmtShort(d.from)} ${d.from.slice(0, 4)} – ${fmtShort(d.to)} ${d.to.slice(0, 4)}`;
+  const printedAt = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const cols = [["Shopify orders", d.shopify], ["Custom orders", d.custom], ["All orders", d.total]];
+  const line = (label, f, bold) => `<tr class="${bold ? "tot" : ""}"><td>${label}</td>${cols.map(([, g]) => `<td class="n">${f(g)}</td>`).join("")}</tr>`;
+  const returned = d.orders.filter((o) => o.returned);
+  const counted = d.orders.filter((o) => !o.returned);
+  const orderRow = (o) => `<tr class="${o.returned ? "ret" : ""}"><td class="b">#${esc(o.order_number)}</td><td>${esc(o.grp === "custom" ? (o.channel || "Custom") : "Shopify")}</td><td>${esc(o.product)} &times; ${esc(o.quantity)}</td><td>${fmtShort(o.on_date)}</td><td>${o.payment === "online" ? "Paid online" : "COD"}</td><td class="n">${o.amount == null ? "&mdash;" : esc(rs(o.amount))}</td><td class="n">${o.cost == null ? "&mdash;" : esc(rs(o.cost))}</td><td>${o.returned ? "<b>RETURNED</b>" : ""}</td></tr>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Finance report</title><style>
+@page { size: A4 portrait; margin: 12mm; }
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { font-family: Arial, Helvetica, sans-serif; color: #1F1710; font-size: 11px; margin: 0; background: #fff; }
+@media screen { body { min-width: 640px; padding: 14px 18px; } }
+.top { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2.5px solid #1F1710; padding-bottom: 7px; }
+h1 { margin: 0; font-size: 22px; letter-spacing: 1px; } .sub { font-size: 11px; color: #4A3F31; margin-top: 2px; }
+.meta { text-align: right; font-size: 11px; line-height: 1.5; }
+h2 { font-size: 12px; letter-spacing: .6px; text-transform: uppercase; margin: 16px 0 6px; }
+table { width: 100%; border-collapse: collapse; } thead { display: table-header-group; } tr { page-break-inside: avoid; }
+th { background: #1F1710; color: #fff; text-align: left; font-size: 9.5px; letter-spacing: .5px; text-transform: uppercase; padding: 6px; }
+th.n, td.n { text-align: right; }
+td { padding: 6px; border-bottom: 1px solid #B9AC96; vertical-align: top; } td.b { font-weight: 700; white-space: nowrap; }
+tr.tot td { font-weight: 700; font-size: 12.5px; border-top: 2px solid #1F1710; border-bottom: 2px solid #1F1710; }
+tr.ret td { background: #EDEDED; }
+.box { border: 2px solid #1F1710; border-radius: 6px; padding: 8px 10px; margin-top: 10px; font-size: 12px; } .box b { font-size: 14px; }
+.small { font-size: 9.5px; color: #4A3F31; margin-top: 4px; } .foot { margin-top: 14px; font-size: 9px; color: #4A3F31; }
+</style></head><body>
+<div class="top"><div><h1>BANJARA GEAR</h1><div class="sub">Finance report &mdash; ${esc(range)}</div><div class="sub">Orders counted by the day they were ${by}</div></div>
+<div class="meta"><b>Printed: ${esc(fmtShort(todayISO()))} ${todayISO().slice(0, 4)}, ${printedAt}</b><br>Printed by: ${esc(user.name)}<br>Owner only</div></div>
+<h2>Summary</h2>
+<table><thead><tr><th></th>${cols.map(([n]) => `<th class="n">${n}</th>`).join("")}</tr></thead><tbody>
+${line("Orders counted", (g) => esc(g.sold_count))}
+${line("Sales (revenue)", (g) => esc(rs(g.revenue)))}
+${line("&nbsp;&nbsp;of which cash on delivery", (g) => esc(rs(g.cod_revenue)))}
+${line("&nbsp;&nbsp;of which paid online", (g) => esc(rs(g.online_revenue)))}
+${line(`Leopards deduction (${esc(d.leopards_pct)}% of COD)`, (g) => `&minus; ${esc(rs(g.leopards))}`)}
+${line("Cost of making", (g) => `&minus; ${esc(rs(g.cost))}`)}
+${line("Ads money spent", (g) => (g === d.custom ? "&mdash;" : `&minus; ${esc(rs(g.ads))}`))}
+${line("Profit", (g) => esc(rs(g.profit)), true)}
+</tbody></table>
+<div class="box"><b>${esc(d.total.returned_count)}</b> order${d.total.returned_count === 1 ? " was" : "s were"} returned (${esc(rs(d.total.returned_amount))}). Returned orders are not counted in sales, the Leopards deduction or cost.</div>
+${d.total.missing_price || d.total.missing_cost ? `<div class="small">Note: ${d.total.missing_price ? esc(d.total.missing_price) + " order(s) have no price. " : ""}${d.total.missing_cost ? esc(d.total.missing_cost) + " order(s) have no cost of making. " : ""}Profit is higher than it really is until these are filled in.</div>` : ""}
+${returned.length ? `<h2>Returned orders</h2><table><thead><tr><th>Order</th><th>From</th><th>Product</th><th>${by === "delivered" ? "Delivered" : "Dispatched"}</th><th>Paid</th><th class="n">Amount</th><th class="n">Cost</th><th></th></tr></thead><tbody>${returned.map(orderRow).join("")}</tbody></table>` : ""}
+<h2>Orders counted (${counted.length})</h2>
+${counted.length ? `<table><thead><tr><th>Order</th><th>From</th><th>Product</th><th>${by === "delivered" ? "Delivered" : "Dispatched"}</th><th>Paid</th><th class="n">Amount</th><th class="n">Cost</th><th></th></tr></thead><tbody>${counted.map(orderRow).join("")}</tbody></table>` : "<p>No orders in these dates.</p>"}
+<div class="foot">Leopards deduction applies to cash-on-delivery orders only. Ads money is entered for these exact dates and counts against Shopify orders only.</div>
+</body></html>`;
+}
+
+function FinanceReport({ data, user, onClose }) {
+  const frame = useRef(null);
+  const html = useMemo(() => buildFinanceReportHtml(data, { user }), [data, user]);
+  const print = () => {
+    const w = frame.current && frame.current.contentWindow;
+    if (!w) return;
+    const old = document.title;
+    document.title = `Finance-report-${data.from}-to-${data.to}`; // becomes the PDF file name
+    const restore = () => { document.title = old; window.removeEventListener("afterprint", restore); };
+    window.addEventListener("afterprint", restore);
+    w.focus();
+    w.print();
+  };
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ backgroundColor: "rgba(36,28,21,0.6)" }}>
+      <div className="flex items-center justify-between gap-3 p-3" style={{ backgroundColor: TOKENS.paper }}>
+        <button onClick={onClose} className="flex items-center gap-1.5 text-sm font-semibold" style={{ color: TOKENS.ink }}><ArrowLeft size={16} /> Back</button>
+        <button onClick={print} className="rounded-xl px-4 py-2 text-sm font-bold text-white" style={{ backgroundColor: TOKENS.saddle }}>Print / Save as PDF</button>
+      </div>
+      <iframe ref={frame} title="Finance report" srcDoc={html} className="flex-1 w-full bg-white" style={{ border: 0 }} />
+    </div>
+  );
+}
+
+function FinancePage({ products, user }) {
+  const [mode, setMode] = useState("month"); // week | month | custom
+  const [by, setBy] = useState("dispatched"); // which date decides if an order counts
+  const [weekStart, setWeekStart] = useState(() => weekStartOf(todayISO()));
+  const [monthStart, setMonthStart] = useState(() => monthStartOf(todayISO()));
+  const [customFrom, setCustomFrom] = useState(() => monthStartOf(todayISO()));
+  const [customTo, setCustomTo] = useState(() => todayISO());
+  const [data, setData] = useState(null);
+  const [prodFin, setProdFin] = useState({});
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [reportOpen, setReportOpen] = useState(false);
+
+  const [from, to] = mode === "week" ? [weekStart, shiftDays(weekStart, 6)] : mode === "month" ? [monthStart, monthEndOf(monthStart)] : [customFrom, customTo];
+  const load = useCallback(async () => {
+    if (!from || !to) return;
+    try {
+      setData(await fetchRangeFinance(from, to, by));
+      setError("");
+    } catch (e) {
+      setData(null);
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [from, to, by]);
+  useEffect(() => { setLoading(true); load(); }, [load]);
+  useEffect(() => {
+    fetchProductFinance().then((rows) => setProdFin(Object.fromEntries(rows.map((r) => [r.product_id, { sell: r.sell_price, cost: r.cost }])))).catch((e) => setError(e.message));
+  }, []);
+
+  const run = async (fn) => { try { await fn(); await load(); } catch (e) { setError(e.message); } };
+  const thisWeek = weekStartOf(todayISO());
+  const thisMonth = monthStartOf(todayISO());
+  const range = mode === "month"
+    ? parseDate(monthStart).toLocaleDateString("en-US", { month: "long", year: "numeric" })
+    : `${fmtShort(from)} ${from.slice(0, 4) === to.slice(0, 4) ? "" : from.slice(0, 4) + " "}– ${fmtShort(to)} ${to.slice(0, 4)}`;
+  const periodWord = mode === "week" ? "week" : mode === "month" ? "month" : "period";
+  const atNow = mode === "week" ? weekStart >= thisWeek : monthStart >= thisMonth;
+  const step = (dir) => (mode === "week" ? setWeekStart(shiftDays(weekStart, 7 * dir)) : setMonthStart(addMonths(monthStart, dir)));
+  const d = data;
+  const pct = d ? Number(d.leopards_pct) : 4;
+
+  const setProductValue = async (id, key, v) => {
+    const cur = prodFin[id] || {};
+    const next = { ...cur, [key]: v };
+    setProdFin((m) => ({ ...m, [id]: next }));
+    await run(() => saveProductFinance(id, { sell_price: next.sell ?? null, cost: next.cost ?? null }));
+  };
+
+  const seg = ({ value, onChange, items }) => (
+    <div className="inline-flex rounded-xl p-1" style={{ backgroundColor: TOKENS.hide }}>
+      {items.map(([k, label]) => (
+        <button key={k} onClick={() => onChange(k)} className="rounded-lg px-3.5 py-1.5 text-sm font-semibold" style={{ backgroundColor: value === k ? "white" : "transparent", color: value === k ? TOKENS.ink : "#8A7B65" }}>{label}</button>
+      ))}
+    </div>
+  );
+  const group = ({ title, g, adsBox }) => (
+    <Section title={title}>
+      <Row label={`Sales (${g.sold_count} order${g.sold_count === 1 ? "" : "s"})`} value={rs(g.revenue)} />
+      <Row label="of which cash on delivery (COD)" value={rs(g.cod_revenue)} />
+      <Row label="of which paid online (no deduction)" value={rs(g.online_revenue)} />
+      <Row label={`Leopards deduction (${pct}% of COD)`} value={`− ${rs(g.leopards)}`} />
+      <Row label="Cost of making" value={`− ${rs(g.cost)}`} />
+      {adsBox ? (
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span style={{ color: "#8A7B65" }}>Ads money spent (these dates)</span>
+          <div className="w-32"><MoneyInput label="Ads money spent" value={d.ads || null} placeholder="0" onCommit={(n) => run(() => saveAdTotal(from, to, n ?? 0))} /></div>
+        </div>
+      ) : (
+        <Row label="Ads money spent" value="none" />
+      )}
+      <div className="border-t pt-2" style={{ borderColor: TOKENS.line }}><Row label="Profit" value={rs(g.profit)} /></div>
+    </Section>
+  );
+
+  return (
+    <div className="p-4 md:p-8 max-w-3xl">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2.5">
+          <Calculator size={20} style={{ color: TOKENS.saddle }} />
+          <h1 className="text-xl font-bold" style={{ color: TOKENS.ink }}>Finance</h1>
+          <span className="text-[11px] font-semibold rounded px-1.5 py-0.5" style={{ backgroundColor: TOKENS.hide, color: "#8A7B65" }}>Owner only</span>
+        </div>
+        <button onClick={() => setReportOpen(true)} disabled={!d} className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-bold text-white disabled:opacity-40" style={{ backgroundColor: TOKENS.saddle }}><Printer size={15} /> Print report</button>
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        {seg({ value: mode, onChange: setMode, items: [["week", "Week"], ["month", "Month"], ["custom", "Pick dates"]] })}
+      </div>
+
+      {mode === "custom" ? (
+        <div className="mt-3 grid grid-cols-2 gap-3 rounded-xl border p-3" style={{ borderColor: TOKENS.line, backgroundColor: "white" }}>
+          <label className="text-xs font-semibold" style={{ color: "#8A7B65" }}>From
+            <input type="date" aria-label="From date" value={customFrom} max={customTo} onChange={(e) => setCustomFrom(e.target.value)} className="input mt-1" />
+          </label>
+          <label className="text-xs font-semibold" style={{ color: "#8A7B65" }}>To
+            <input type="date" aria-label="To date" value={customTo} min={customFrom} onChange={(e) => setCustomTo(e.target.value)} className="input mt-1" />
+          </label>
+        </div>
+      ) : (
+        <div className="mt-3 flex items-center justify-between gap-2 rounded-xl border p-2" style={{ borderColor: TOKENS.line, backgroundColor: "white" }}>
+          <button aria-label={`Previous ${periodWord}`} onClick={() => step(-1)} className="p-2 rounded-lg"><ChevronLeft size={18} /></button>
+          <div className="text-center">
+            <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>{range}</p>
+            <p className="text-[11px]" style={{ color: "#A8977F" }}>{atNow ? `This ${periodWord}` : <button onClick={() => (mode === "week" ? setWeekStart(thisWeek) : setMonthStart(thisMonth))} className="underline font-semibold">Go to this {periodWord}</button>}</p>
+          </div>
+          <button aria-label={`Next ${periodWord}`} onClick={() => step(1)} disabled={atNow} className="p-2 rounded-lg disabled:opacity-30"><ChevronRight size={18} /></button>
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <span className="text-xs font-semibold" style={{ color: "#8A7B65" }}>Count orders by the day they were</span>
+        {seg({ value: by, onChange: setBy, items: [["dispatched", "Dispatched"], ["delivered", "Delivered"]] })}
+      </div>
+
+      {error && <div className="mt-3 rounded-xl p-3 text-sm" style={{ backgroundColor: "#FBEAE5", color: "#B23A22" }}>{error}</div>}
+      {loading && !d && <p className="mt-4 text-sm" style={{ color: "#A8977F" }}>Loading…</p>}
+
+      {d && (
+        <>
+          <div className="mt-4 rounded-2xl p-4 text-white" style={{ backgroundColor: TOKENS.ink }}>
+            <p className="text-xs uppercase tracking-wide" style={{ color: "#C9BCA8" }}>Total profit · {range}</p>
+            <p className="text-3xl font-bold mt-1" data-testid="profit">{rs(d.total.profit)}</p>
+            <p className="text-xs mt-1" style={{ color: "#C9BCA8" }}>
+              Sales {rs(d.total.revenue)} · {d.total.sold_count} order{d.total.sold_count === 1 ? "" : "s"} counted
+            </p>
+            {d.total.returned_count > 0 && (
+              <p className="text-xs mt-1 font-semibold" style={{ color: "#F0E4D0" }}>{d.total.returned_count} order{d.total.returned_count === 1 ? " was" : "s were"} returned ({rs(d.total.returned_amount)}), not counted</p>
+            )}
+          </div>
+
+          {(d.total.missing_price > 0 || d.total.missing_cost > 0) && (
+            <div className="mt-3 rounded-xl px-3 py-2.5 text-sm font-semibold" style={{ backgroundColor: "#FBEAD3", color: "#9A5A12" }}>
+              {d.total.missing_price > 0 && <p>{d.total.missing_price} order{d.total.missing_price === 1 ? " has" : "s have"} no price yet. Type it in the list below.</p>}
+              {d.total.missing_cost > 0 && <p>{d.total.missing_cost} order{d.total.missing_cost === 1 ? " has" : "s have"} no cost of making. Set it under Product prices and costs.</p>}
+              <p className="text-xs font-normal mt-0.5">Profit is higher than it really is until these are filled in.</p>
+            </div>
+          )}
+
+          <div className="mt-4">{group({ title: "Shopify orders", g: d.shopify, adsBox: true })}</div>
+          <div className="mt-4">{group({ title: "Custom orders (no ads)", g: d.custom })}</div>
+          <div className="mt-4">
+            <Section title="All orders together">
+              <Row label="Sales" value={rs(d.total.revenue)} />
+              <Row label="Leopards deduction" value={`− ${rs(d.total.leopards)}`} />
+              <Row label="Cost of making" value={`− ${rs(d.total.cost)}`} />
+              <Row label="Ads money spent" value={`− ${rs(d.total.ads)}`} />
+              <div className="border-t pt-2" style={{ borderColor: TOKENS.line }}><Row label="Profit" value={rs(d.total.profit)} /></div>
+            </Section>
+          </div>
+
+          <div className="mt-4">
+            <Section title={`Orders in these dates (${d.orders.length})`}>
+              {d.orders.length === 0 && <p className="text-sm" style={{ color: "#A8977F" }}>No orders were {by} in this period.</p>}
+              {d.orders.map((o) => (
+                <div key={o.id} className="py-2 border-b last:border-b-0" style={{ borderColor: TOKENS.line }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-bold" style={{ color: TOKENS.ink }}>#{o.order_number} <span className="text-[11px] font-semibold" style={{ color: "#8A7B65" }}>{o.grp === "custom" ? (o.channel || "Custom") : "Shopify"}</span> {o.returned && <span className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-bold text-white" style={{ backgroundColor: TOKENS.ink }}>RETURNED</span>}</p>
+                    <p className="text-[11px] shrink-0" style={{ color: "#8A7B65" }}>{by} {fmtShort(o.on_date)}</p>
+                  </div>
+                  <p className="text-xs truncate" style={{ color: "#8A7B65" }}>{o.product} × {o.quantity}{o.cost != null ? ` · cost ${rs(o.cost)}` : " · no cost set"}</p>
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <div className="w-28"><MoneyInput label={`Amount for order ${o.order_number}`} value={o.amount} placeholder="Price" onCommit={(n) => run(() => saveOrderAmount(o.id, n))} /></div>
+                    <button onClick={() => run(() => saveOrderPayment(o.id, o.payment === "cod" ? "online" : "cod"))} aria-label={`Payment for order ${o.order_number}`} className="rounded-lg border px-2.5 py-1.5 text-[11px] font-bold whitespace-nowrap" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>{o.payment === "cod" ? "COD" : "Paid online"}</button>
+                    <button onClick={() => run(() => setOrderReturned(o.id, !o.returned))} className="ml-auto rounded-lg border px-2.5 py-1.5 text-[11px] font-bold whitespace-nowrap" style={{ borderColor: TOKENS.line, color: TOKENS.ink }}>{o.returned ? "Undo return" : "Returned"}</button>
+                  </div>
+                </div>
+              ))}
+              <p className="text-[11px]" style={{ color: "#A8977F" }}>Tap COD / Paid online to switch how an order was paid. Only COD orders get the Leopards deduction.</p>
+            </Section>
+          </div>
+        </>
+      )}
+
+      <details className="mt-4 rounded-xl border bg-white" style={{ borderColor: TOKENS.line }}>
+        <summary className="cursor-pointer p-3 text-sm font-bold" style={{ color: TOKENS.ink }}>Product prices and costs</summary>
+        <div className="px-3 pb-3">
+          <p className="text-xs mb-2" style={{ color: "#A8977F" }}>Cost of making is used for every order. Selling price is used only when an order has no price of its own (old orders and custom orders).</p>
+          <div className="grid grid-cols-[1fr_6rem_6rem] gap-2 text-[11px] font-semibold uppercase" style={{ color: "#8A7B65" }}>
+            <span>Product</span><span className="text-right">Sell price</span><span className="text-right">Cost</span>
+          </div>
+          {products.map((p) => (
+            <div key={p.id} className="grid grid-cols-[1fr_6rem_6rem] gap-2 items-center mt-1.5">
+              <span className="text-sm truncate" style={{ color: TOKENS.ink }}>{p.name}</span>
+              <MoneyInput label={`${p.name} selling price`} value={prodFin[p.id]?.sell ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "sell", n)} />
+              <MoneyInput label={`${p.name} cost`} value={prodFin[p.id]?.cost ?? null} placeholder="—" onCommit={(n) => setProductValue(p.id, "cost", n)} />
+            </div>
+          ))}
+          <div className="mt-4 flex items-center justify-between gap-3 border-t pt-3" style={{ borderColor: TOKENS.line }}>
+            <span className="text-sm" style={{ color: "#8A7B65" }}>Leopards deduction (%)</span>
+            <div className="w-24"><MoneyInput label="Leopards deduction percent" value={pct} onCommit={(n) => run(() => saveLeopardsPct(n ?? 4))} /></div>
+          </div>
+        </div>
+      </details>
+      <p className="mt-3 text-[11px]" style={{ color: "#A8977F" }}>Returned orders are left out of sales, the Leopards deduction and cost. Ads money is saved for the exact dates you picked and counts against Shopify orders only.</p>
+      {reportOpen && d && <FinanceReport data={d} user={user} onClose={() => setReportOpen(false)} />}
+    </div>
+  );
+}
+
 function MembersPage({ user }) {
   const [members, setMembers] = useState(null);
   const [error, setError] = useState("");
@@ -2366,6 +2744,7 @@ export default function App() {
   else if (["pending", "production", "completed", "dispatched"].includes(page)) content = <OrderListPage status={page} orders={orders} loading={ordersLoading} error={ordersError} onRetry={() => refreshOrders()} {...listProps} />;
   else if (page === "print") content = <PrintListPage orders={orders} settings={settings} user={user} productNameFor={productNameFor} loading={ordersLoading} error={ordersError} onRetry={() => refreshOrders()} />;
   else if (page === "products") content = <ProductsPage products={products} loading={productsLoading} error={productsError} user={user} onOpenProduct={setSelectedProduct} onAdd={() => setEditingProduct("new")} onRetry={refreshProducts} />;
+  else if (page === "finance" && isOwner) content = <FinancePage products={products} user={user} />;
   else if (page === "members" && isOwner) content = <MembersPage user={user} />;
   else if (page === "settings" && isOwner) content = <SettingsPage settings={settings} onSave={saveSettingsChanges} />;
   else if (page === "account") content = <AccountPage user={user} />;
